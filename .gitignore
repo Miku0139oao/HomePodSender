@@ -1,0 +1,53 @@
+# ---- 构建产物 ----
+bin/
+obj/
+target/
+dist/
+sidecar-publish/
+publish/
+src-tauri/gen/
+*.nupkg
+
+# ---- 依赖 ----
+node_modules/
+
+# ---- 设计参考素材（第三方原图，不随仓库分发）----
+design-ref/source.png
+design-ref/source.webp
+design-ref/app-icons/
+
+# ---- 截图 / 测试中间产物 ----
+Desktop/shots/
+shots/live/
+shots/*/live/
+
+# ---- 运行产物 / 日志 ----
+*.log
+logs/
+*.dmp
+*.etl
+
+# ---- IDE / 编辑器 / 系统 ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 本地配置 / 证书 / 密钥 ----
+.env
+.env.*
+config.local.json
+*.pfx
+*.p12
+*.snk
+
+# ---- 设计参考衍生图（由 --dump-tray / 裁切脚本生成，可重建）----
+design-ref/*.png
+design-ref/*.webp
+design-ref/app-icons/
+design-ref/tray/

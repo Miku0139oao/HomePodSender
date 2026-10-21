@@ -1,0 +1,16 @@
+{
+  "Devices": [
+    {
+      "Name": "\u5047 HomePod",
+      "Ip": "127.0.0.1",
+      "Role": "",
+      "PairId": ""
+    }
+  ],
+  "Ip": "127.0.0.1",
+  "VolumePercent": 33,
+  "LatencyMs": 1000,
+  "AutoReconnect": true,
+  "AutoConnectOnStart": false,
+  "DeviceId": "02:11:22:33:44:55"
+}

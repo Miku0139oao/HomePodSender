@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Ap2Core</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\Desktop\lipsync\extension\manifest.json" LogicalName="lipsync.manifest.json" />
+    <EmbeddedResource Include="..\Desktop\lipsync\extension\bridge.js" LogicalName="lipsync.bridge.js" />
+    <EmbeddedResource Include="..\Desktop\lipsync\extension\main.js" LogicalName="lipsync.main.js" />
+    <EmbeddedResource Include="..\Desktop\lipsync\extension\sw.js" LogicalName="lipsync.sw.js" />
+  </ItemGroup>
+</Project>

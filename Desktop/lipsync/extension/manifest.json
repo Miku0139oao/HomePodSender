@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "HomePod 画面对齐",
+  "version": "1.0.0",
+  "description": "把网页画面推迟到和 HomePod 的播放延迟一致。声音仍立刻送出。",
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": { "service_worker": "sw.js" },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ]
+}

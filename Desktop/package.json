@@ -1,0 +1,29 @@
+{
+  "name": "homepod-sender",
+  "productName": "HomePodSender",
+  "version": "2.0.0",
+  "private": true,
+  "description": "把电脑声音实时推送到 HomePod（AirPlay 2）",
+  "author": "HomePodSender",
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:web": "vite",
+    "build": "vite build",
+    "tauri": "tauri",
+    "sidecar:debug": "dotnet build ../Sidecar/HomePodSidecar.csproj -v q",
+    "sidecar": "dotnet publish ../Sidecar/HomePodSidecar.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o sidecar-publish",
+    "shots": "npm run build && node scripts/screenshot.mjs",
+    "e2e": "dotnet build ../Ap2Cli/Ap2Cli.csproj -v q && npm run sidecar:debug && npm run build && node scripts/e2e.mjs",
+    "pack": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.3",
+    "@vitejs/plugin-react": "5.2.0",
+    "vite": "7.3.7"
+  }
+}
