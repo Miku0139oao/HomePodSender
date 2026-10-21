@@ -8,6 +8,9 @@
 
 前端是 **Tauri 2 + React 19 + Vite 7**；Rust 外壳负责窗口、托盘、单实例与 sidecar 进程。AirPlay 协议、WASAPI 回环抓取与重采样仍由原来的 C#（`Ap2Core`）负责，通过 `Sidecar` 进程以 NDJSON over stdio 暴露给界面，协议和音频链路没有重写。
 
+> **下载**：[Releases](https://github.com/YFPS/HomePodSender/releases) —— 安装包（当前用户，无需管理员）或免安装 zip。
+> 需要 Windows 10/11 x64、WebView2 运行时和 .NET 8 桌面运行时；从源码构建见下文。
+
 | 未播放 | 推流中 |
 |---|---|
 | ![](shots/idle.png) | ![](shots/streaming.png) |
@@ -26,7 +29,7 @@
 
 ## 怎么用
 
-1. 运行 `Desktop\src-tauri\target\release\bundle\nsis\HomePodSender_2.0.0_x64-setup.exe` 安装（当前用户，无需管理员）。
+1. 从 [Releases](https://github.com/YFPS/HomePodSender/releases) 下 `HomePodSender_*_x64-setup.exe` 安装（当前用户，无需管理员），或解压免安装 zip 后直接运行 `HomePodSender\HomePodSender.exe`（需保留旁边的 `sidecar\HomePodSidecar.exe`）。
 2. 从开始菜单启动 HomePodSender。屏幕中央先出现光团，约 2 秒后飞到右下角，面板在任务栏上方展开。
 3. **左边高卡（AirPlay）**：点设备行选择要推流的 HomePod；「扫描设备」搜索局域网，「IP」手动添加。
 4. **右上卡（光球）**：轻点光球开始推流，再点一下断开。卡片下方显示设备名和推流时长。
