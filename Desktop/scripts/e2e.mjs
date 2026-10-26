@@ -152,7 +152,7 @@ try {
   const orbLabel = () => cdp.eval(`document.querySelector('.orb-btn')?.getAttribute('aria-label') || ''`);
   const volText = () => cdp.eval(`document.querySelector('.vol-val')?.textContent || ''`);
   ok('右上卡显示设备名', (await title()) === '假 HomePod', await title());
-  ok('未播放提示', (await sub()) === '轻点光球 · 推流', await sub());
+  ok('未播放提示', (await sub()) === '輕點光球 · 開始推流', await sub());
   ok('设备列表勾选当前设备', await cdp.eval(`document.querySelector('.row.on .row-label')?.textContent === '假 HomePod'`));
   ok('点阵标题 AIR PLAY', await cdp.eval(`document.querySelectorAll('.face-front .headline circle').length > 40`));
   ok('光球画布在渲染', await cdp.eval(`(() => { const c = document.querySelector('.orb-btn canvas'); return !!c && c.width > 0; })()`));
@@ -161,10 +161,10 @@ try {
   await click(cdp, '.orb-btn');
   const connected = await waitFor(() => cdp.eval(`!!document.querySelector('.shell.mode-streaming')`), 25000);
   ok('轻点光球进入推流', connected, await sub());
-  ok('光球按钮变为断开', (await orbLabel()) === '断开', await orbLabel());
+  ok('光球按钮变为断开', (await orbLabel()) === '中斷連線', await orbLabel());
   await sleep(1600);
   const s1 = await sub();
-  ok('计时器在走', /^\d\d:\d\d · 实时$/.test(s1) && !s1.startsWith('00:00'), s1);
+  ok('计时器在走', /^\d\d:\d\d · 即時$/.test(s1) && !s1.startsWith('00:00'), s1);
 
   /* ---------- 音量 ---------- */
   const ladder = await rectOf(cdp, '.ladder');
@@ -201,17 +201,52 @@ try {
   if (toSettings) {
     await sleep(700); // 等翻转动画结束再点背面
     const back = await cdp.eval(`document.querySelector('.face-back').innerText.replace(/\\s+/g, ' ')`);
-    ok('设置项齐全', ['断线自动重连', '启动时自动连接', '播放延迟', '背景卡片'].every((s) => back.includes(s)), back);
-    const latency = () => cdp.eval(`document.querySelector('.face-back .rows > .row:nth-child(3) .row-tag')?.textContent || ''`);
+    ok('设置项齐全', ['音訊', '斷線自動重連', '啟動時自動連線', '播放延遲', '背景卡片'].every((s) => back.includes(s)), back);
+    ok('音訊來源預設跟隨系統', await cdp.eval(`document.querySelector('[data-setting="audio"] .audio-tag')?.textContent === '跟隨系統預設'`));
+
+    // 语言切换必须同步整个界面；切回繁中后继续后续测试。
+    await click(cdp, '.language-mini');
+    await waitFor(() => cdp.eval(`document.documentElement.lang === 'en' && document.querySelector('.face-back').innerText.includes('Reconnect automatically')`), 1500, 100);
+    ok('切換英文介面', await cdp.eval(`document.documentElement.lang === 'en' && document.querySelector('.language-mini')?.textContent === '繁中'`));
+    await click(cdp, '.language-mini');
+    await waitFor(() => cdp.eval(`document.documentElement.lang === 'zh-TW' && document.querySelector('.face-back').innerText.includes('斷線自動重連')`), 1500, 100);
+    ok('切回繁體中文介面', await cdp.eval(`document.documentElement.lang === 'zh-TW' && document.querySelector('.language-mini')?.textContent === 'EN'`));
+
+    await click(cdp, '[data-setting="audio"]');
+    const audioPickerOpen = await waitFor(() => cdp.eval(`!!document.querySelector('.rows-audio')`), 1500, 100);
+    ok('開啟音訊輸出選擇', audioPickerOpen);
+    const audioRows = await cdp.eval(`document.querySelectorAll('.rows-audio .row').length`);
+    ok('音訊選擇列出系統預設與播放裝置', audioRows >= 2, `rows=${audioRows}`);
+    await click(cdp, '.rows-audio .row:nth-child(2)');
+    const fixedAudio = await waitFor(() => !!(readCfg().AudioCaptureDeviceId), 4000, 100);
+    ok('可綁定指定聲卡並寫入配置', fixedAudio, `AudioCaptureDeviceId=${readCfg().AudioCaptureDeviceId || '(default)'}`);
+    const fixedPickerClosed = await waitFor(() => cdp.eval(`!!document.querySelector('.rows-set')`), 5000, 100);
+    ok('切換指定聲卡後返回設定', fixedPickerClosed);
+    const resumedAfterAudio = await waitFor(() => cdp.eval(`!!document.querySelector('.shell.mode-streaming')`), 30000, 150);
+    ok('播放中切換聲卡會自動重新連線', resumedAfterAudio, await sub());
+    await click(cdp, '[data-setting="audio"]');
+    await waitFor(() => cdp.eval(`!!document.querySelector('.rows-audio')`), 1500, 100);
+    await click(cdp, '.rows-audio .row:first-child');
+    const defaultAudio = await waitFor(() => readCfg().AudioCaptureDeviceId === '', 4000, 100);
+    ok('可切回跟隨系統預設', defaultAudio, `AudioCaptureDeviceId=${readCfg().AudioCaptureDeviceId || '(default)'}`);
+    const defaultPickerClosed = await waitFor(() => cdp.eval(`!!document.querySelector('.rows-set')`), 5000, 100);
+    ok('切回預設後返回設定', defaultPickerClosed);
+    const resumedAfterDefault = await waitFor(() => cdp.eval(`!!document.querySelector('.shell.mode-streaming')`), 30000, 150);
+    ok('切回預設後恢復推流', resumedAfterDefault, await sub());
+
+    const latency = () => cdp.eval(`document.querySelector('[data-setting="latency"] .row-tag')?.textContent || ''`);
     ok('延迟显示 1s', (await latency()) === '1s', await latency());
-    await click(cdp, '.face-back .rows > .row:nth-child(3)');
-    await waitFor(async () => (await latency()) === '1.5s', 1500, 100);
-    ok('点击延迟切到 1.5s', (await latency()) === '1.5s', await latency());
-    for (let i = 0; i < 3; i++) { await click(cdp, '.face-back .rows > .row:nth-child(3)'); await sleep(250); }
-    ok('延迟循环回到 1s', (await latency()) === '1s', await latency());
+    await click(cdp, '[data-setting="latency"]');
+    await waitFor(async () => (await latency()) === '0.5s', 1500, 100);
+    ok('点击延迟切到 0.5s', (await latency()) === '0.5s', await latency());
+    for (const expected of ['0.25s', '0.1s', '0s']) {
+      await click(cdp, '[data-setting="latency"]');
+      await waitFor(async () => (await latency()) === expected, 1500, 100);
+      ok(`延迟可切到 ${expected}`, (await latency()) === expected, await latency());
+    }
 
     // 背景卡片开关：关掉后板外框消失、柔焦背景按卡片形状裁剪，并写入配置；再打开恢复
-    const boardRow = '.face-back .rows > .row:nth-child(4)';
+    const boardRow = '[data-setting="board"]';
     const noBoard = () => cdp.eval(`!!document.querySelector('.shell.no-board')`);
     ok('背景卡片默认开启', !(await noBoard()) && readCfg().ShowBoard !== false);
     await click(cdp, boardRow);
@@ -237,7 +272,7 @@ try {
   await click(cdp, '.orb-btn');
   const disconnected = await waitFor(() => cdp.eval(`!!document.querySelector('.shell.mode-idle')`), 15000);
   ok('再次轻点光球断开', disconnected, await sub());
-  ok('光球按钮变回连接', (await orbLabel()) === '连接', await orbLabel());
+  ok('光球按钮变回连接', (await orbLabel()) === '連線', await orbLabel());
 
   /* ---------- 收起 / 唤出 ---------- */
   // 窗口在系统层面是否可见（WebView2 的 visibilityState 不随窗口隐藏变化，改问 Tauri）

@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Ap2Core;
+using Ap2Core.Audio;
 
 namespace HomePodSidecar;
 
@@ -32,6 +33,8 @@ internal static class Program
     {
         if (args.Length > 0 && args[0] == "--lipsync-policy")
             return LipSyncPolicyCommand(args);
+        if (args.Length > 0 && args[0] == "--tone-test")
+            return await ToneTest(args);
 
         Console.OutputEncoding = Encoding.UTF8;
         _out = Console.OpenStandardOutput();
@@ -115,13 +118,43 @@ internal static class Program
 
                 case "setLatency":
                 {
-                    int ms = Math.Clamp(Int(msg, "value", _cfg.LatencyMs), 250, 2000);
+                    int ms = Math.Clamp(Int(msg, "value", _cfg.LatencyMs), 0, 2000);
                     _cfg.LatencyMs = ms;
                     _ctl.Settings.LatencyMs = ms;
                     SaveNow();
                     Reply(id, new { latencyMs = ms });
                     break;
                 }
+
+                case "setAudioDevice":
+                {
+                    string endpointId = Str(msg, "deviceId").Trim();
+                    var endpoints = LoopbackCapture.GetRenderEndpoints();
+                    if (endpointId.Length > 0 && endpoints.All(x => x.Id != endpointId))
+                        throw new InvalidOperationException("选择的音频输出设备当前不可用");
+
+                    bool changed = endpointId != _cfg.AudioCaptureDeviceId;
+                    bool restart = changed && _ctl.State != StreamState.Disconnected;
+                    if (changed)
+                    {
+                        string selected = endpointId.Length == 0
+                            ? "跟随 Windows 默认播放设备"
+                            : endpoints.First(x => x.Id == endpointId).Name;
+                        Logger.Write("切换音频来源: " + selected);
+                        _cfg.AudioCaptureDeviceId = endpointId;
+                        _ctl.Settings.AudioCaptureDeviceId = endpointId;
+                        SaveNow();
+                        Send(new { ev = "config", config = Snapshot() });
+                    }
+                    if (restart) await _ctl.DisconnectAsync();
+                    Reply(id, new { audioCaptureDeviceId = endpointId, config = Snapshot() });
+                    if (restart) _ = Task.Run(ConnectCore);
+                    break;
+                }
+
+                case "refreshAudioDevices":
+                    Reply(id, new { config = Snapshot() });
+                    break;
 
                 case "setOptions":
                 {
@@ -412,8 +445,26 @@ internal static class Program
                 showBoard = _cfg.ShowBoard,
                 videoSync = _cfg.VideoSync,
                 deviceId = _cfg.DeviceId,
+                audioCaptureDeviceId = _cfg.AudioCaptureDeviceId,
+                audioDevices = AudioDeviceList(),
                 devices = DeviceList(),
             };
+    }
+
+    static object[] AudioDeviceList()
+    {
+        try
+        {
+            return LoopbackCapture.GetRenderEndpoints()
+                .Select(x => new { id = x.Id, name = x.Name, isDefault = x.IsDefault })
+                .Cast<object>()
+                .ToArray();
+        }
+        catch (Exception e)
+        {
+            Logger.Write("列举音频输出设备失败: " + e.Message);
+            return Array.Empty<object>();
+        }
     }
 
     // ---------- 工具 ----------
@@ -614,5 +665,41 @@ internal static class Program
         Logger.Write("sidecar 退出");
         try { _out.Flush(); } catch { }
         Environment.Exit(0);
+    }
+
+    /// <summary>诊断用：绕过界面与回环抓取，直接向 HomePod 发送一段测试音。</summary>
+    static async Task<int> ToneTest(string[] args)
+    {
+        Console.OutputEncoding = Encoding.UTF8;
+        var cfg = AppConfig.Load();
+        string ip = args.Length > 1 ? args[1] : cfg.Ip;
+        double seconds = args.Length > 2 && double.TryParse(args[2], out var s) ? s : 10;
+        double volumeDb = args.Length > 3 && double.TryParse(args[3], out var v) ? v : -6;
+        seconds = Math.Clamp(seconds, 1, 60);
+        using var session = new Ap2Session(new Ap2Options
+        {
+            Ip = ip,
+            Port = 7000,
+            LatencyFrames = 500 * Ap2Session.Rate / 1000,
+            DeviceId = cfg.DeviceId,
+        });
+        session.LogMessage += Console.WriteLine;
+        try
+        {
+            await session.ConnectAsync();
+            await session.SetVolumeDbAsync(volumeDb);
+            session.StartStreaming(new ToneSource(440));
+            Console.WriteLine($"播放 440 Hz 测试音 {seconds:0.#} 秒，音量 {volumeDb:0.#} dB");
+            await Task.Delay(TimeSpan.FromSeconds(seconds));
+            Console.WriteLine($"统计: 音频包 {session.AudioPackets} 同步包 {session.SyncPackets} 授时应答 {session.TimingReplies}");
+            await session.StopAsync();
+            return 0;
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("测试音失败: " + e.Message);
+            try { await session.StopAsync(); } catch { }
+            return 1;
+        }
     }
 }

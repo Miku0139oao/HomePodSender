@@ -1,6 +1,6 @@
 [package]
 name = "homepod-sender"
-version = "2.0.0"
+version = "2.0.1"
 description = "把电脑声音实时推送到 HomePod（AirPlay 2）"
 authors = ["HomePodSender"]
 edition = "2021"

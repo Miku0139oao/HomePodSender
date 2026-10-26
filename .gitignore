@@ -5,11 +5,13 @@ target/
 dist/
 sidecar-publish/
 publish/
+artifacts/
 src-tauri/gen/
 *.nupkg
 
 # ---- 依赖 ----
 node_modules/
+.tools/
 
 # ---- 设计参考素材（第三方原图，不随仓库分发）----
 design-ref/source.png
@@ -26,6 +28,9 @@ shots/*/live/
 logs/
 *.dmp
 *.etl
+tests/test-data/lipsync-ext/
+tests/test-data/lipsync-key.pem
+tests/test-data/log.txt
 
 # ---- IDE / 编辑器 / 系统 ----
 .vs/

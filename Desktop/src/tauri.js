@@ -32,6 +32,8 @@ if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
     /** 启动动画落地，交接给面板 */
     introDone: () => invoke('intro_done').catch(() => {}),
     openLogs: () => invoke('open_logs').catch(() => {}),
+    /** Keep native tray labels in sync with the selected UI language. */
+    setTrayLanguage: (language) => invoke('set_tray_language', { language }).catch(() => {}),
     minimize: () => win.minimize().catch(() => {}),
     hide: () => invoke('panel_hidden').catch(() => {}),
     quit: () => invoke('quit_app'),

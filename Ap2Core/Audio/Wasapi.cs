@@ -9,7 +9,7 @@ class MMDeviceEnumeratorCom { }
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IMMDeviceEnumerator
 {
-    [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+    [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
     [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
     [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
     [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr client);
@@ -20,9 +20,33 @@ interface IMMDeviceEnumerator
 interface IMMDevice
 {
     [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
-    [PreserveSig] int OpenPropertyStore(int access, out IntPtr props);
+    [PreserveSig] int OpenPropertyStore(int access, out IPropertyStore props);
     [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
     [PreserveSig] int GetState(out int state);
+}
+
+[ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceCollection
+{
+    [PreserveSig] int GetCount(out uint devices);
+    [PreserveSig] int Item(uint index, out IMMDevice device);
+}
+
+[ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IPropertyStore
+{
+    [PreserveSig] int GetCount(out uint props);
+    [PreserveSig] int GetAt(uint index, out PropertyKey key);
+    [PreserveSig] int GetValue(ref PropertyKey key, IntPtr value);
+    [PreserveSig] int SetValue(ref PropertyKey key, IntPtr value);
+    [PreserveSig] int Commit();
+}
+
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+struct PropertyKey
+{
+    public Guid FormatId;
+    public int PropertyId;
 }
 
 [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -55,6 +79,9 @@ public sealed record MixFormat(int SampleRate, int Channels, int BitsPerSample, 
 {
     public override string ToString() => $"{SampleRate}Hz {Channels}声道 {BitsPerSample}位 {(IsFloat ? "浮点" : "整数")} 声道掩码=0x{ChannelMask:X}";
 }
+
+/// <summary>Windows 播放端点。ID 可稳定保存，名称只用于界面显示。</summary>
+public sealed record AudioEndpoint(string Id, string Name, bool IsDefault);
 
 /// <summary>
 /// WASAPI 回环抓取：把默认播放端点（或指定端点）正在播放的混音抓下来，转成立体声浮点（设备原采样率）回调出去。
@@ -105,6 +132,93 @@ public sealed class LoopbackCapture : IDisposable
             try { if (en != null) Marshal.ReleaseComObject(en); } catch { }
         }
     }
+
+    /// <summary>列出当前启用的 Windows 播放端点，默认设备排在最前。</summary>
+    public static IReadOnlyList<AudioEndpoint> GetRenderEndpoints()
+    {
+        IMMDeviceEnumerator? en = null;
+        IMMDeviceCollection? collection = null;
+        try
+        {
+            en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+            Marshal.ThrowExceptionForHR(en.EnumAudioEndpoints(0, 1, out collection)); // eRender, DEVICE_STATE_ACTIVE
+            string? defaultId = GetDefaultRenderId();
+            Marshal.ThrowExceptionForHR(collection.GetCount(out uint count));
+            var result = new List<AudioEndpoint>((int)count);
+            for (uint i = 0; i < count; i++)
+            {
+                IMMDevice? dev = null;
+                try
+                {
+                    Marshal.ThrowExceptionForHR(collection.Item(i, out dev));
+                    Marshal.ThrowExceptionForHR(dev.GetId(out string id));
+                    string name = ReadFriendlyName(dev);
+                    if (string.IsNullOrWhiteSpace(name)) name = id;
+                    result.Add(new AudioEndpoint(id, name.Trim(), id == defaultId));
+                }
+                catch
+                {
+                    // 单个端点刚好被拔出时不影响其余端点。
+                }
+                finally
+                {
+                    if (dev != null) Marshal.ReleaseComObject(dev);
+                }
+            }
+            return result
+                .OrderByDescending(x => x.IsDefault)
+                .ThenBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase)
+                .ToArray();
+        }
+        catch (Exception e)
+        {
+            throw new InvalidOperationException("无法列举 Windows 播放设备: " + e.Message, e);
+        }
+        finally
+        {
+            if (collection != null) Marshal.ReleaseComObject(collection);
+            if (en != null) Marshal.ReleaseComObject(en);
+        }
+    }
+
+    static string ReadFriendlyName(IMMDevice device)
+    {
+        IPropertyStore? store = null;
+        IntPtr value = IntPtr.Zero;
+        try
+        {
+            Marshal.ThrowExceptionForHR(device.OpenPropertyStore(0, out store)); // STGM_READ
+            var key = new PropertyKey
+            {
+                FormatId = new Guid("A45C254E-DF1C-4EFD-8020-67D146A850E0"),
+                PropertyId = 14, // PKEY_Device_FriendlyName
+            };
+            value = Marshal.AllocHGlobal(24);
+            ZeroMemory(value, 24);
+            Marshal.ThrowExceptionForHR(store.GetValue(ref key, value));
+            ushort vt = (ushort)Marshal.ReadInt16(value, 0);
+            if (vt != 31) return ""; // VT_LPWSTR
+            IntPtr text = Marshal.ReadIntPtr(value, 8);
+            return text == IntPtr.Zero ? "" : Marshal.PtrToStringUni(text) ?? "";
+        }
+        finally
+        {
+            if (value != IntPtr.Zero)
+            {
+                try { PropVariantClear(value); } catch { }
+                Marshal.FreeHGlobal(value);
+            }
+            if (store != null) Marshal.ReleaseComObject(store);
+        }
+    }
+
+    static void ZeroMemory(IntPtr destination, int length)
+    {
+        for (int i = 0; i < length; i++) Marshal.WriteByte(destination, i, 0);
+    }
+
+    [DllImport("ole32.dll")]
+    static extern int PropVariantClear(IntPtr value);
 
     /// <summary>启动抓取线程并等待初始化完成；失败抛异常</summary>
     public void Start()

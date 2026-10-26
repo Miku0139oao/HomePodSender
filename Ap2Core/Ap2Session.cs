@@ -307,7 +307,9 @@ public sealed class Ap2Session : IDisposable
         var stream = new PDict
         {
             { "audioFormat", 0x40000 }, { "audioMode", "default" }, { "controlPort", _ctrl!.Port }, { "ct", 2 }, { "isMedia", true },
-            { "latencyMax", 88200 }, { "latencyMin", 11025 }, { "shk", _audioKey }, { "spf", Frames }, { "sr", Rate }, { "type", 0x60 },
+            { "latencyMax", Math.Max(88200, _o.LatencyFrames) },
+            { "latencyMin", _o.LatencyFrames == 0 ? 0 : Math.Min(11025, _o.LatencyFrames) },
+            { "shk", _audioKey }, { "spf", Frames }, { "sr", Rate }, { "type", 0x60 },
             { "supportsDynamicStreamID", false }, { "streamConnectionID", (long)_sessionId },
         };
         if (_o.AdvertiseDataPort) stream.Add("dataPort", _audio!.Port);

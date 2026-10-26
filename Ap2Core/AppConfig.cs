@@ -33,6 +33,8 @@ public sealed class AppConfig
     /// <summary>界面：显示三张卡片后面的背景卡片（关掉后卡片各自悬浮在桌面上）</summary>
     public bool ShowBoard { get; set; } = true;
     public string DeviceId { get; set; } = "";
+    /// <summary>WASAPI 回环抓取的输出端点 ID；空字符串表示跟随 Windows 默认播放设备</summary>
+    public string AudioCaptureDeviceId { get; set; } = "";
     /// <summary>每个立体声对（PairId）最近一次确认过的组长 IP。配对报告含糊时仍以它为准，避免直连成员把分组打散</summary>
     public Dictionary<string, string> PairLeaders { get; set; } = new();
 
@@ -54,7 +56,7 @@ public sealed class AppConfig
             cfg.Ip = "192.168.50.71";
         }
         cfg.VolumePercent = Math.Clamp(cfg.VolumePercent, 0, 100);
-        cfg.LatencyMs = Math.Clamp(cfg.LatencyMs, 250, 2000);
+        cfg.LatencyMs = Math.Clamp(cfg.LatencyMs, 0, 2000);
         return cfg;
     }
 
@@ -71,6 +73,7 @@ public sealed class AppConfig
     public ControllerSettings ToControllerSettings() => new()
     {
         Ip = Ip, VolumePercent = VolumePercent, LatencyMs = LatencyMs, AutoReconnect = AutoReconnect, DeviceId = DeviceId,
+        AudioCaptureDeviceId = AudioCaptureDeviceId,
     };
 }
 

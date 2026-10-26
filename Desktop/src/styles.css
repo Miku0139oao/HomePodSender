@@ -237,6 +237,14 @@ html[data-browser-preview] body {
 .mini:active { transform: scale(0.92); }
 .mini-right { right: 12px; }
 .mini-left { left: 12px; }
+.language-mini {
+  width: auto;
+  min-width: 38px;
+  padding: 0 9px;
+  border-radius: 14px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
 
 /* ---------- 胶囊行 ---------- */
 .rows {
@@ -248,9 +256,40 @@ html[data-browser-preview] body {
   flex-direction: column;
   gap: 6px;
 }
-/* 设置面五行，行高收一点，避免顶到标题 */
-.rows-set { gap: 5px; }
-.rows-set .row { height: 36px; border-radius: 18px; }
+/* 设置面六行，行高收一点，避免顶到标题 */
+.rows-set { gap: 4px; }
+.rows-set .row { height: 34px; border-radius: 17px; }
+.rows-set .row-label { font-size: 14px; }
+.rows-audio { top: 126px; bottom: auto; }
+.rows-audio .audio-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 190px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.rows-audio .audio-scroll::-webkit-scrollbar { display: none; }
+.rows-audio .row-label { font-size: 15px; }
+.audio-tag {
+  max-width: 88px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+[data-setting="audio"] {
+  gap: 8px;
+  padding-right: 8px;
+}
+[data-setting="audio"] .row-label {
+  flex: none;
+  font-size: 13.5px;
+}
+[data-setting="audio"] .audio-tag {
+  flex: 1 1 auto;
+  max-width: none;
+  text-align: right;
+}
 .device-scroll {
   display: flex;
   flex-direction: column;

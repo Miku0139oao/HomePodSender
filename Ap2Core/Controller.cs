@@ -18,6 +18,8 @@ public sealed class ControllerSettings
     public int VolumePercent { get; set; } = 20;
     public bool AutoReconnect { get; set; } = true;
     public string DeviceId { get; set; } = "";
+    /// <summary>WASAPI 回环抓取端点；空字符串表示跟随 Windows 默认播放设备</summary>
+    public string AudioCaptureDeviceId { get; set; } = "";
 
     /// <summary>这次要连接的地址。多台时保持调用方给的顺序</summary>
     public List<string> Targets()
@@ -62,9 +64,13 @@ public sealed class HomePodController : IDisposable
     public event Action<string>? LogMessage;
 
     /// <summary>音频源工厂；默认抓取系统声音，测试时可替换</summary>
-    public Func<Action<string>, IAudioSource> SourceFactory { get; set; } = log => new SystemAudioSource(log);
+    public Func<Action<string>, IAudioSource> SourceFactory { get; set; }
 
-    public HomePodController(ControllerSettings settings) => Settings = settings;
+    public HomePodController(ControllerSettings settings)
+    {
+        Settings = settings;
+        SourceFactory = log => new SystemAudioSource(log, Settings.AudioCaptureDeviceId);
+    }
 
     void Log(string m) => LogMessage?.Invoke(m);
 
@@ -162,7 +168,7 @@ public sealed class HomePodController : IDisposable
             {
                 Ip = ip,
                 Port = Settings.PortOf(ip),
-                LatencyFrames = Math.Clamp(Settings.LatencyMs, 250, 2000) * Ap2Session.Rate / 1000,
+                LatencyFrames = Math.Clamp(Settings.LatencyMs, 0, 2000) * Ap2Session.Rate / 1000,
                 DeviceId = Settings.DeviceId,
             });
             s.LogMessage += line => Log(ip + " " + line);

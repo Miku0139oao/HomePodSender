@@ -7,15 +7,18 @@ namespace Ap2Core.Audio;
 public sealed class SystemAudioSource : IAudioSource, IDisposable
 {
     readonly Action<string> _log;
+    readonly string? _deviceId;
     readonly object _lock = new();
     readonly Timer _watch;
     LoopbackSource? _cur;
     volatile bool _disposed;
     int _failures;
 
-    public SystemAudioSource(Action<string> log)
+    public SystemAudioSource(Action<string> log, string? deviceId = null)
     {
         _log = log;
+        _deviceId = string.IsNullOrWhiteSpace(deviceId) ? null : deviceId;
+        if (_deviceId != null) _log("固定音讯输出端点，不跟随 Windows 默认设备");
         Open();
         _watch = new Timer(_ => Check(), null, 2000, 2000);
     }
@@ -28,7 +31,7 @@ public sealed class SystemAudioSource : IAudioSource, IDisposable
     {
         try
         {
-            var s = new LoopbackSource(_log);
+            var s = new LoopbackSource(_log, _deviceId);
             s.CaptureStopped += why => OnStopped(s, why);
             lock (_lock) _cur = s;
             _failures = 0;
@@ -54,9 +57,17 @@ public sealed class SystemAudioSource : IAudioSource, IDisposable
         if (_disposed) return;
         try
         {
-            string? def = LoopbackCapture.GetDefaultRenderId();
             LoopbackSource? c;
             lock (_lock) c = _cur;
+
+            // 固定端点模式不跟随默认设备变化；设备暂时消失时仍按同一个 ID 重试。
+            if (_deviceId != null)
+            {
+                if (c == null) Open();
+                return;
+            }
+
+            string? def = LoopbackCapture.GetDefaultRenderId();
             if (c != null && (def == null || def == c.DeviceId)) return;
             if (c != null) _log("默认播放设备已变化，切换系统声音抓取");
             LoopbackSource? old;

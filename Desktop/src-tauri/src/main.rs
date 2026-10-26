@@ -33,8 +33,11 @@ struct SidecarState {
 }
 
 struct TrayItems {
+    show: MenuItem<tauri::Wry>,
     connect: MenuItem<tauri::Wry>,
     disconnect: MenuItem<tauri::Wry>,
+    logs: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
     tray: TrayIcon<tauri::Wry>,
 }
 
@@ -48,6 +51,8 @@ struct UiState {
     /// 最近的声音电平（f32 位模式）
     level: AtomicU32,
     intro_running: AtomicBool,
+    language: Mutex<String>,
+    last_status: Mutex<String>,
 }
 
 impl UiState {
@@ -59,6 +64,8 @@ impl UiState {
             stream: AtomicU8::new(0),
             level: AtomicU32::new(0f32.to_bits()),
             intro_running: AtomicBool::new(false),
+            language: Mutex::new("zh-TW".into()),
+            last_status: Mutex::new(String::new()),
         }
     }
 }
@@ -364,19 +371,80 @@ fn toggle_panel(app: &AppHandle) {
 
 // ======================= 托盘 =======================
 
+fn tray_language(language: &str) -> &'static str {
+    if language.to_ascii_lowercase().starts_with("zh") { "zh-TW" } else { "en" }
+}
+
+fn tray_status(language: &str, status: &str) -> String {
+    if tray_language(language) == "zh-TW" {
+        return status
+            .replace("连接", "連線")
+            .replace("断线", "斷線")
+            .replace("断开", "中斷")
+            .replace("重连", "重新連線")
+            .replace("系统", "系統")
+            .replace("网络", "網路")
+            .replace("设备", "裝置")
+            .replace("无响应", "無回應");
+    }
+    let text = status.trim();
+    if text == "未连接" { return "Not connected".into(); }
+    if text == "已连接，正在播放系统声音" { return "Connected, playing system audio".into(); }
+    if text.starts_with("已连接") { return text.replace("已连接", "Connected").replace("台", " devices").replace("，正在播放系统声音", ", playing system audio"); }
+    if text.starts_with("正在连接") { return "Connecting…".into(); }
+    if text.starts_with("重新连接") || text.starts_with("重连") { return "Reconnecting…".into(); }
+    if text.starts_with("连接失败") { return "Connection failed".into(); }
+    if text.starts_with("连接已断开") { return "Connection closed".into(); }
+    if text.is_empty() { "HomePod Sender".into() } else { text.to_string() }
+}
+
+fn tray_tooltip(language: &str, status: &str) -> String {
+    let prefix = if tray_language(language) == "zh-TW" { "HomePod 推流" } else { "HomePod Sender" };
+    let status = tray_status(language, status);
+    if status.is_empty() { prefix.to_string() } else { format!("{prefix} — {status}") }
+}
+
+fn apply_tray_language(items: &TrayItems, language: &str) {
+    let zh = tray_language(language) == "zh-TW";
+    let _ = items.show.set_text(if zh { "顯示面板" } else { "Show panel" });
+    let _ = items.connect.set_text(if zh { "連線" } else { "Connect" });
+    let _ = items.disconnect.set_text(if zh { "中斷連線" } else { "Disconnect" });
+    let _ = items.logs.set_text(if zh { "開啟日誌資料夾" } else { "Open log folder" });
+    let _ = items.quit.set_text(if zh { "結束" } else { "Quit" });
+}
+
+#[tauri::command]
+fn set_tray_language(app: AppHandle, language: String) {
+    let language = tray_language(&language).to_string();
+    let status = if let Some(ui) = app.try_state::<UiState>() {
+        *ui.language.lock().unwrap() = language.clone();
+        ui.last_status.lock().unwrap().clone()
+    } else {
+        String::new()
+    };
+    if let Some(items) = app.try_state::<TrayItems>() {
+        apply_tray_language(&items, &language);
+        let _ = items.tray.set_tooltip(Some(&tray_tooltip(&language, &status)));
+    }
+}
+
 fn update_tray_state(app: &AppHandle, state: &str, status: &str) {
-    if let Some(ui) = app.try_state::<UiState>() {
+    let language = if let Some(ui) = app.try_state::<UiState>() {
         let v = match state {
             "Streaming" => 2,
             "Connecting" | "Reconnecting" => 1,
             _ => 0,
         };
         ui.stream.store(v, Ordering::Relaxed);
-    }
+        *ui.last_status.lock().unwrap() = status.to_string();
+        ui.language.lock().unwrap().clone()
+    } else {
+        "zh-TW".to_string()
+    };
     if let Some(items) = app.try_state::<TrayItems>() {
         let _ = items.connect.set_enabled(state == "Disconnected");
         let _ = items.disconnect.set_enabled(state == "Streaming" || state == "Reconnecting");
-        let tip: String = format!("HomePod 推流：{status}").chars().take(100).collect();
+        let tip: String = tray_tooltip(&language, status).chars().take(100).collect();
         let _ = items.tray.set_tooltip(Some(&tip));
     }
 }
@@ -419,11 +487,11 @@ fn spawn_tray_animator(app: AppHandle) {
 }
 
 fn create_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "显示面板", true, None::<&str>)?;
-    let connect = MenuItem::with_id(app, "connect", "连接", true, None::<&str>)?;
-    let disconnect = MenuItem::with_id(app, "disconnect", "断开", false, None::<&str>)?;
-    let logs = MenuItem::with_id(app, "logs", "打开日志文件夹", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "顯示面板", true, None::<&str>)?;
+    let connect = MenuItem::with_id(app, "connect", "連線", true, None::<&str>)?;
+    let disconnect = MenuItem::with_id(app, "disconnect", "中斷連線", false, None::<&str>)?;
+    let logs = MenuItem::with_id(app, "logs", "開啟日誌資料夾", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&show, &sep1, &connect, &disconnect, &logs, &sep2, &quit])?;
@@ -448,7 +516,7 @@ fn create_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .build(app)?;
 
-    app.manage(TrayItems { connect, disconnect, tray });
+    app.manage(TrayItems { show, connect, disconnect, logs, quit, tray });
     Ok(())
 }
 
@@ -530,6 +598,7 @@ fn main() {
             panel_hidden,
             panel_visible,
             open_logs,
+            set_tray_language,
             quit_app
         ])
         .setup(move |app| {

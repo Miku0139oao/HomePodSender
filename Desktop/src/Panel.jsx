@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import DotText from './DotText.jsx';
 import Orb from './Orb.jsx';
 import { BackIcon, CheckIcon, GearIcon, PauseGlyph, PlayGlyph, PlusIcon, SpeakerIcon } from './icons.jsx';
+import { localizeMessage, localizeRole, localizeStatus, persistLanguage, readLanguage, translate } from './i18n.js';
 import { CARDS_CLIP, LAYOUT, preview } from './layout.js';
 
 /*
@@ -11,7 +12,7 @@ import { CARDS_CLIP, LAYOUT, preview } from './layout.js';
  *  · 右下卡（对应 “Your files”）：点阵音量阶梯 + 圆形静音键 + “音量 32%”。
  */
 
-const LATENCIES = [500, 1000, 1500, 2000];
+const LATENCIES = [0, 100, 250, 500, 1000, 1500, 2000];
 const LADDER = 14;
 
 /** 预览数据：?pair=broken 时两台都报告自己是组长且未成对（与 HomePod 当前的实际报告一致） */
@@ -23,13 +24,23 @@ function mockDevices() {
   ];
 }
 
+function mockAudioDevices() {
+  return [
+    { id: 'speakers', name: '喇叭 (Realtek(R) Audio)', isDefault: true },
+    { id: 'cable', name: 'CABLE Input (VB-Audio Virtual Cable)', isDefault: false },
+    { id: 'headphones', name: '耳機 (AirPods Pro)', isDefault: false },
+    { id: 'hdmi', name: 'GS27U (NVIDIA High Definition Audio)', isDefault: false },
+    { id: 'usb', name: '喇叭 (HyperX QuadCast S)', isDefault: false },
+  ];
+}
+
 function previewConnection(mode) {
   switch (mode) {
-    case 'streaming': return { state: 'Streaming', status: '已连接，正在播放系统声音' };
-    case 'connecting': return { state: 'Connecting', status: '正在连接 192.168.50.71 …' };
-    case 'reconnecting': return { state: 'Reconnecting', status: '连接中断，正在重连（第 2 次）…' };
-    case 'failed': return { state: 'Disconnected', status: '连接失败：HomePod 无响应，请检查 IP 与网络' };
-    default: return { state: 'Disconnected', status: '未连接' };
+    case 'streaming': return { state: 'Streaming', status: '' };
+    case 'connecting': return { state: 'Connecting', status: '' };
+    case 'reconnecting': return { state: 'Reconnecting', status: '' };
+    case 'failed': return { state: 'Disconnected', status: 'connection failed' };
+    default: return { state: 'Disconnected', status: '' };
   }
 }
 
@@ -48,21 +59,31 @@ function formatTime(sec) {
     : `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
 }
 
+function formatLatency(ms) {
+  return `${Number((ms / 1000).toFixed(2))}s`;
+}
+
 export default function Panel() {
   const isPreview = preview.active;
-  const [conn, setConn] = useState(isPreview ? previewConnection(preview.state) : { state: 'Disconnected', status: '未连接' });
+  const [conn, setConn] = useState(isPreview ? previewConnection(preview.state) : { state: 'Disconnected', status: '' });
   const [config, setConfig] = useState(isPreview ? {
     ip: '192.168.50.71',
     ips: preview.pair === 'broken' ? ['192.168.50.71', '192.168.50.23'] : ['192.168.50.71'],
     volumePercent: preview.volume, latencyMs: 1500, autoReconnect: true, autoConnectOnStart: false,
     showBoard: preview.board, videoSync: false, devices: mockDevices(),
-  } : { ip: '', ips: [], volumePercent: 20, latencyMs: 1500, autoReconnect: true, autoConnectOnStart: false, showBoard: true, videoSync: false, devices: [] });
+    audioCaptureDeviceId: '', audioDevices: mockAudioDevices(),
+  } : {
+    ip: '', ips: [], volumePercent: 20, latencyMs: 1500, autoReconnect: true, autoConnectOnStart: false,
+    showBoard: true, videoSync: false, devices: [], audioCaptureDeviceId: '', audioDevices: [],
+  });
   const [volume, setVolumeState] = useState(isPreview ? preview.volume : 20);
-  const [page, setPage] = useState(preview.page === 'settings' ? 'settings' : 'devices');
-  const [scan, setScan] = useState({ active: false, progress: 0, message: '' });
+  const [page, setPage] = useState(preview.page === 'settings' || preview.page === 'audio' ? 'settings' : 'devices');
+  const [audioPicker, setAudioPicker] = useState(preview.page === 'audio');
+  const [scan, setScan] = useState({ active: false, progress: 0, message: '', count: null });
   const [adding, setAdding] = useState(false);
   const [ipInput, setIpInput] = useState('');
   const [hint, setHint] = useState('');
+  const [language, setLanguage] = useState(readLanguage);
   const [elapsed, setElapsed] = useState(isPreview && preview.state === 'streaming' ? 207 : 0);
   const [loaded, setLoaded] = useState(isPreview);
   // 面板开合：standby = 全透明待命（窗口隐藏或等待启动动画落地）；open = 展开；closing = 收拢中
@@ -77,12 +98,13 @@ export default function Panel() {
   const volTimer = useRef(null);
   const hintTimer = useRef(null);
   const ipRef = useRef(null);
+  const t = useCallback((key, values) => translate(language, key, values), [language]);
 
   const mode = useMemo(() => {
     if (conn.state === 'Streaming') return 'streaming';
     if (conn.state === 'Connecting') return 'connecting';
     if (conn.state === 'Reconnecting') return 'reconnecting';
-    if (/连接失败|连接已断开|重连失败|核心进程/.test(conn.status)) return 'failed';
+    if (/连接失败|连接已断开|重连失败|核心进程|connection failed|connection closed|reconnect failed|core process/i.test(conn.status)) return 'failed';
     return 'idle';
   }, [conn]);
   const live = mode === 'streaming';
@@ -91,9 +113,23 @@ export default function Panel() {
   const targets = config.ips?.length ? config.ips : (config.ip ? [config.ip] : []);
   const both = targets.length >= 2;
   const device = config.devices.find((d) => d.ip === config.ip) || config.devices.find((d) => targets.includes(d.ip));
-  const deviceName = both ? '两台一起' : (device?.name || (config.ip ? 'HomePod' : '未选择设备'));
+  const deviceName = both ? t('device.both') : (device?.name || (config.ip ? 'HomePod' : t('device.none')));
   // 未成对且只有一台目标：只会从这一台出声。两台目标时各推一路完整声音
   const unpaired = !!(device?.unpaired || config.devices.some((d) => targets.includes(d.ip) && d.unpaired));
+  const selectedAudio = config.audioDevices?.find((d) => d.id === config.audioCaptureDeviceId);
+  const audioLabel = config.audioCaptureDeviceId
+    ? (selectedAudio?.name || t('settings.audioUnavailable'))
+    : t('settings.systemDefault');
+  const audioOptions = [
+    { id: '', name: t('settings.systemDefault'), isDefault: false },
+    ...(config.audioDevices || []),
+  ];
+
+  useEffect(() => {
+    document.documentElement.lang = language;
+    document.title = t('app.title');
+    window.hps?.setTrayLanguage?.(language);
+  }, [language, t]);
 
   /* ---------- sidecar 事件 ---------- */
   useEffect(() => {
@@ -113,9 +149,9 @@ export default function Panel() {
         case 'devices': setConfig((c) => ({ ...c, devices: ev.devices })); break;
         case 'level': levelRef.current = ev.value; break;
         case 'scan':
-          if (ev.phase === 'start') setScan({ active: true, progress: 0, message: '' });
+          if (ev.phase === 'start') setScan({ active: true, progress: 0, message: '', count: null });
           else if (ev.phase === 'progress') setScan((s) => ({ ...s, active: true, progress: ev.progress }));
-          else if (ev.phase === 'done') setScan({ active: false, progress: 100, message: ev.count ? `找到 ${ev.count} 台` : '没有找到' });
+          else if (ev.phase === 'done') setScan({ active: false, progress: 100, message: '', count: ev.count });
           break;
         case 'error': setConn({ state: 'Disconnected', status: ev.message }); setLoaded(true); break;
         default: break;
@@ -162,12 +198,13 @@ export default function Panel() {
   useEffect(() => {
     const onKey = (e) => {
       if (e.key !== 'Escape') return;
+      if (audioPicker) { setAudioPicker(false); return; }
       if (adding) { setAdding(false); return; }
       if (window.hps) setPhase((p) => (p === 'open' ? 'closing' : p));
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [adding]);
+  }, [adding, audioPicker]);
 
   /* ---------- 计时 ---------- */
   useEffect(() => {
@@ -213,7 +250,7 @@ export default function Panel() {
     try {
       if (live || mode === 'reconnecting') await window.hps.call('disconnect');
       else {
-        if (!config.ip) { setHint('先在左侧选择设备'); return; }
+        if (!config.ip) { setHint(t('tip.selectDevice')); return; }
         await window.hps.call('connect');
       }
     } catch { /* 失败原因由状态事件带回 */ }
@@ -233,10 +270,10 @@ export default function Panel() {
   }
 
   async function doScan() {
-    if (isPreview) { setScan({ active: false, progress: 100, message: '找到 2 台' }); return; }
-    setScan({ active: true, progress: 0, message: '' });
+    if (isPreview) { setScan({ active: false, progress: 100, message: '', count: 2 }); return; }
+    setScan({ active: true, progress: 0, message: '', count: null });
     try { await window.hps.call('scan'); }
-    catch (e) { setScan({ active: false, progress: 0, message: e.message }); }
+    catch (e) { setScan({ active: false, progress: 0, message: e.message, count: null }); }
   }
 
   async function addIp() {
@@ -273,11 +310,47 @@ export default function Panel() {
     }
   }
 
+  async function openAudioPicker() {
+    setHint('');
+    setAudioPicker(true);
+    if (isPreview || !window.hps) return;
+    try {
+      const r = await window.hps.call('refreshAudioDevices');
+      if (r?.config) setConfig(r.config);
+    } catch (e) {
+      setHint(e.message);
+    }
+  }
+
+  async function pickAudioDevice(id) {
+    setHint('');
+    if (isPreview) {
+      setConfig((c) => ({ ...c, audioCaptureDeviceId: id }));
+      setAudioPicker(false);
+      return;
+    }
+    try {
+      const r = await window.hps.call('setAudioDevice', { deviceId: id });
+      if (r?.config) setConfig(r.config);
+      setAudioPicker(false);
+      setHint(t('status.audioChanged'));
+      clearTimeout(hintTimer.current);
+      hintTimer.current = setTimeout(() => setHint(''), 4000);
+    } catch (e) {
+      setHint(e.message);
+    }
+  }
+
   function cycleLatency() {
     const i = LATENCIES.indexOf(config.latencyMs);
-    const ms = LATENCIES[(i + 1) % LATENCIES.length];
+    const ms = LATENCIES[(i - 1 + LATENCIES.length) % LATENCIES.length];
     setConfig((c) => ({ ...c, latencyMs: ms }));
     if (!isPreview) window.hps?.call('setLatency', { value: ms }).catch(() => {});
+  }
+
+  function cycleLanguage() {
+    const next = language === 'zh-TW' ? 'en' : 'zh-TW';
+    setLanguage(persistLanguage(next));
   }
 
   /* ---------- 音量阶梯拖动 ---------- */
@@ -297,22 +370,34 @@ export default function Panel() {
   function onVolumeWheel(e) { changeVolume(volume + (e.deltaY < 0 ? 2 : -2)); }
 
   /* ---------- 文案 ---------- */
-  let sub = '轻点光球 · 推流';
+  const displayHint = localizeMessage(language, hint);
+  const displayStatus = localizeStatus(language, conn.status);
+  let sub = t('status.idle');
   let subClass = '';
-  if (!loaded) sub = '正在启动…';
-  else if (hint) { sub = hint; subClass = 'warn'; }
+  if (!loaded) sub = t('status.starting');
+  else if (hint) { sub = displayHint; subClass = 'warn'; }
   else if (live) {
-    sub = both ? `${formatTime(elapsed)} · 两台同时` : unpaired ? `${formatTime(elapsed)} · 仅此一台` : `${formatTime(elapsed)} · 实时`;
+    sub = both
+      ? t('status.bothStreaming', { time: formatTime(elapsed) })
+      : unpaired
+        ? t('status.oneStreaming', { time: formatTime(elapsed) })
+        : t('status.realtime', { time: formatTime(elapsed) });
     subClass = unpaired && !both ? 'warn' : '';
   }
-  else if (mode === 'connecting') sub = both ? '正在连接两台…' : '正在连接…';
-  else if (mode === 'reconnecting') sub = '重新连接中…';
-  else if (mode === 'failed') { sub = '连接失败'; subClass = 'warn'; }
-  else if (both) sub = '两台同时';
-  else if (unpaired) { sub = '未组立体声对'; subClass = 'warn'; }
+  else if (mode === 'connecting') sub = both ? t('status.connectingBoth') : t('status.connecting');
+  else if (mode === 'reconnecting') sub = t('status.reconnecting');
+  else if (mode === 'failed') { sub = t('status.connectionFailed'); subClass = 'warn'; }
+  else if (both) sub = t('status.both');
+  else if (unpaired) { sub = t('status.unpaired'); subClass = 'warn'; }
 
   const lit = Math.round((volume / 100) * LADDER);
-  const scanLabel = scan.active ? `扫描中 ${scan.progress || 0}%` : (scan.message || '扫描设备');
+  const scanLabel = scan.active
+    ? t('common.scanning', { progress: scan.progress || 0 })
+    : scan.count != null
+      ? t(scan.count ? 'common.found' : 'common.notFound', { count: scan.count })
+      : scan.message
+        ? localizeMessage(language, scan.message)
+        : t('common.scan');
   const orbColor = live ? 1 : busy ? 0.55 : 0;
   const showBoard = config.showBoard !== false;
 
@@ -340,21 +425,21 @@ export default function Panel() {
           <div className="flipper">
             {/* React 19 的 inert 是布尔属性（传空串会被当成 false 而不写入） */}
             <div className="face face-front" aria-hidden={page !== 'devices'} inert={page !== 'devices'}>
-              <button className="mini mini-right" aria-label="设置" title="设置" onClick={() => setPage('settings')}><GearIcon size={13} /></button>
+              <button className="mini mini-right" aria-label={t('settings.open')} title={t('settings.open')} onClick={() => { setAudioPicker(false); setPage('settings'); }}><GearIcon size={13} /></button>
               <DotText lines={['AIR', 'PLAY']} pitch={5} dot={3.6} className="headline" />
               <div className="rows">
                 <div className="device-scroll">
                   {config.devices.length === 0 && (
-                    <div className="row ghost"><span className="row-label dim">还没有设备</span></div>
+                    <div className="row ghost"><span className="row-label dim">{t('common.noDevices')}</span></div>
                   )}
                   {config.devices.map((d) => {
                     const on = targets.includes(d.ip);
                     return (
                       <button className={`row${on ? ' on' : ''}${d.role === '成员' ? ' member' : ''}`} key={d.ip} onClick={() => pickDevice(d)}
-                        title={both && d.unpaired ? '两台一起推流，每只播放完整声音，不是左右声道' : d.unpaired ? '两台 HomePod 没有组成立体声对，只会从所选的这一台出声；请在家庭 App 里重新设置立体声对' : d.role === '成员' ? '立体声对的成员，点击会自动改选组长' : d.ip}>
+                        title={both && d.unpaired ? t('tip.bothPlayback') : d.unpaired ? t('tip.unpairedPlayback') : d.role === '成员' ? t('tip.stereoMember') : d.ip}>
                         <span className={`check${on ? ' on' : ''}`}>{on && <CheckIcon />}</span>
                         <span className="row-label">{d.name || 'HomePod'}</span>
-                        {d.role && <span className="row-tag mono">{d.role}</span>}
+                        {d.role && <span className="row-tag mono">{localizeRole(language, d.role)}</span>}
                       </button>
                     );
                   })}
@@ -366,9 +451,9 @@ export default function Panel() {
                       ref={ipRef} className="row-input mono" placeholder="192.168.x.x" value={ipInput}
                       onChange={(e) => setIpInput(e.target.value)}
                       onKeyDown={(e) => { if (e.key === 'Enter') addIp(); }}
-                      aria-label="手动输入 IP"
+                      aria-label={t('common.manualIp')}
                     />
-                    <button className="row-chip" onClick={addIp}>添加</button>
+                    <button className="row-chip" onClick={addIp}>{t('common.add')}</button>
                   </div>
                 ) : (
                   <div className="row action">
@@ -376,41 +461,90 @@ export default function Panel() {
                       <span className={`check plus${scan.active ? ' spin' : ''}`}><PlusIcon /></span>
                       <span className="row-label">{scanLabel}</span>
                     </button>
-                    <button className="row-chip mono" onClick={() => setAdding(true)} title="手动输入 IP">IP</button>
+                    <button className="row-chip mono" onClick={() => setAdding(true)} title={t('common.manualIp')}>IP</button>
                   </div>
                 )}
               </div>
             </div>
 
             <div className="face face-back" aria-hidden={page !== 'settings'} inert={page !== 'settings'}>
-              <button className="mini mini-left" aria-label="返回" title="返回" onClick={() => setPage('devices')}><BackIcon size={13} /></button>
-              {/* 设置面有五行选项，标题略小并上移，行高也收一点 */}
-              <DotText lines={['SET', 'UP']} pitch={4.2} dot={3.1} className="headline headline-sm" />
-              <div className="rows rows-set">
-                <button className={`row${config.autoReconnect ? ' on' : ''}`} onClick={() => setOption('autoReconnect')}>
-                  <span className={`check${config.autoReconnect ? ' on' : ''}`}>{config.autoReconnect && <CheckIcon />}</span>
-                  <span className="row-label">断线自动重连</span>
+              <button
+                className="mini mini-left"
+                aria-label={t('common.back')}
+                title={t('common.back')}
+                onClick={() => {
+                  if (audioPicker) setAudioPicker(false);
+                  else { setAudioPicker(false); setPage('devices'); }
+                }}
+              ><BackIcon size={13} /></button>
+              {!audioPicker && (
+                <button
+                  className="mini mini-right language-mini mono"
+                  aria-label={language === 'zh-TW' ? t('settings.switchToEnglish') : t('settings.switchToTraditional')}
+                  title={language === 'zh-TW' ? t('settings.switchToEnglish') : t('settings.switchToTraditional')}
+                  onClick={cycleLanguage}
+                >
+                  {language === 'zh-TW' ? 'EN' : '繁中'}
                 </button>
-                <button className={`row${config.autoConnectOnStart ? ' on' : ''}`} onClick={() => setOption('autoConnectOnStart')}>
-                  <span className={`check${config.autoConnectOnStart ? ' on' : ''}`}>{config.autoConnectOnStart && <CheckIcon />}</span>
-                  <span className="row-label">启动时自动连接</span>
-                </button>
-                <button className="row" onClick={cycleLatency} title="延迟越大越抗网络抖动；看视频请选小一点。下次连接生效。对齐画面用的就是这个数">
-                  <span className="check ring"><i /></span>
-                  <span className="row-label">播放延迟</span>
-                  <span className="row-tag mono">{config.latencyMs / 1000}s</span>
-                </button>
-                <button className={`row${config.videoSync ? ' on' : ''}`} onClick={() => setOption('videoSync')}
-                  title="插件只推迟 Chrome 网页画面，声音仍马上送出，口型按上面的播放延迟对齐。这台电脑自动安装会弹出一次管理员确认；若取消，就按提示手动加载插件。打开后保持本程序运行，并完全退出再打开一次 Chrome">
-                  <span className={`check${config.videoSync ? ' on' : ''}`}>{config.videoSync && <CheckIcon />}</span>
-                  <span className="row-label">对齐画面</span>
-                  {config.videoSync && <span className="row-tag mono">{config.latencyMs / 1000}s</span>}
-                </button>
-                <button className={`row${showBoard ? ' on' : ''}`} onClick={() => setOption('showBoard')} title="关掉后三张卡片各自悬浮在桌面上">
-                  <span className={`check${showBoard ? ' on' : ''}`}>{showBoard && <CheckIcon />}</span>
-                  <span className="row-label">背景卡片</span>
-                </button>
-              </div>
+              )}
+              <DotText
+                lines={audioPicker ? ['AU', 'DIO'] : ['SET', 'UP']}
+                pitch={4.2}
+                dot={3.1}
+                className="headline headline-sm"
+              />
+              {audioPicker ? (
+                <div className="rows rows-audio" role="group" aria-label={t('settings.audioPickerTitle')}>
+                  <div className="audio-scroll">
+                    {audioOptions.map((option) => {
+                      const selected = option.id === (config.audioCaptureDeviceId || '');
+                      return (
+                        <button
+                          key={option.id || 'system-default'}
+                          data-audio-device={option.id}
+                          className={`row${selected ? ' on' : ''}`}
+                          onClick={() => pickAudioDevice(option.id)}
+                          title={option.name}
+                        >
+                          <span className={`check${selected ? ' on' : ''}`}>{selected && <CheckIcon />}</span>
+                          <span className="row-label">{option.name}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="rows rows-set">
+                  <button className="row" data-setting="audio" onClick={openAudioPicker} title={t('tip.audioOutput')}>
+                    <span className="check ring"><i /></span>
+                    <span className="row-label">{t('settings.audioOutput')}</span>
+                    <span className="row-tag mono audio-tag" title={audioLabel}>{audioLabel}</span>
+                  </button>
+                  <button className={`row${config.autoReconnect ? ' on' : ''}`} onClick={() => setOption('autoReconnect')}>
+                    <span className={`check${config.autoReconnect ? ' on' : ''}`}>{config.autoReconnect && <CheckIcon />}</span>
+                    <span className="row-label">{t('settings.autoReconnect')}</span>
+                  </button>
+                  <button className={`row${config.autoConnectOnStart ? ' on' : ''}`} onClick={() => setOption('autoConnectOnStart')}>
+                    <span className={`check${config.autoConnectOnStart ? ' on' : ''}`}>{config.autoConnectOnStart && <CheckIcon />}</span>
+                    <span className="row-label">{t('settings.autoConnect')}</span>
+                  </button>
+                  <button className="row" data-setting="latency" onClick={cycleLatency} title={t('tip.latency')}>
+                    <span className="check ring"><i /></span>
+                    <span className="row-label">{t('settings.latency')}</span>
+                    <span className="row-tag mono">{formatLatency(config.latencyMs)}</span>
+                  </button>
+                  <button className={`row${config.videoSync ? ' on' : ''}`} data-setting="video-sync" onClick={() => setOption('videoSync')}
+                    title={t('tip.videoSync')}>
+                    <span className={`check${config.videoSync ? ' on' : ''}`}>{config.videoSync && <CheckIcon />}</span>
+                    <span className="row-label">{t('settings.videoSync')}</span>
+                    {config.videoSync && <span className="row-tag mono">{formatLatency(config.latencyMs)}</span>}
+                  </button>
+                  <button className={`row${showBoard ? ' on' : ''}`} data-setting="board" onClick={() => setOption('showBoard')} title={t('tip.showBoard')}>
+                    <span className={`check${showBoard ? ' on' : ''}`}>{showBoard && <CheckIcon />}</span>
+                    <span className="row-label">{t('settings.showBoard')}</span>
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </section>
@@ -419,14 +553,14 @@ export default function Panel() {
         <section className="card now glass">
           <div className="now-text">
             <div className="now-title" title={both ? targets.map((ip) => config.devices.find((d) => d.ip === ip)?.name || ip).join(' · ') : config.ip}>{deviceName}</div>
-            <div className={`now-sub mono ${subClass}`} title={hint ? hint : mode === 'failed' ? conn.status : both ? '每只 HomePod 播放同一路完整声音。左右声道要在家庭 App 里组成立体声对' : unpaired ? '两台 HomePod 没有组成立体声对，只会从当前设备出声' : undefined}>{sub}</div>
+            <div className={`now-sub mono ${subClass}`} title={hint ? displayHint : mode === 'failed' ? displayStatus : both ? t('tip.bothPlayback') : unpaired ? t('tip.unpairedPlayback') : undefined}>{sub}</div>
           </div>
         </section>
 
         {/* ---------- 右下：音量 ---------- */}
         <section className="card vol glass" onWheel={onVolumeWheel}>
           <div
-            className="ladder" ref={ladderRef} role="slider" aria-label="音量" aria-valuemin={0} aria-valuemax={100} aria-valuenow={volume}
+            className="ladder" ref={ladderRef} role="slider" aria-label={t('common.volume')} aria-valuemin={0} aria-valuemax={100} aria-valuenow={volume}
             onPointerDown={onLadderDown} onPointerMove={onLadderMove} onPointerUp={onLadderUp} onPointerCancel={onLadderUp}
           >
             {Array.from({ length: LADDER }, (_, i) => {
@@ -441,10 +575,10 @@ export default function Panel() {
             })}
           </div>
           <div className="vol-row">
-            <button className="round" aria-label="静音 / 恢复" title="静音 / 恢复" onClick={toggleMute}>
+            <button className="round" aria-label={t('common.mute')} title={t('common.mute')} onClick={toggleMute}>
               <SpeakerIcon size={17} muted={volume < 0.5} />
             </button>
-            <span className="vol-label">音量</span>
+            <span className="vol-label">{t('common.volume')}</span>
             <span className="vol-val mono">{volume}%</span>
           </div>
           <span className="iris" aria-hidden="true" />
@@ -458,8 +592,8 @@ export default function Panel() {
       <button
         className={`orb-btn${busy ? ' busy' : ''}`}
         style={{ left: LAYOUT.orbX, top: LAYOUT.orbY }}
-        aria-label={live || mode === 'reconnecting' ? '断开' : '连接'}
-        title={live || mode === 'reconnecting' ? '断开' : '连接 HomePod'}
+        aria-label={live || mode === 'reconnecting' ? t('connection.disconnect') : t('connection.start')}
+        title={live || mode === 'reconnecting' ? t('connection.disconnect') : t('connection.startHomePod')}
         disabled={!loaded || mode === 'connecting'}
         onClick={togglePlay}
       >

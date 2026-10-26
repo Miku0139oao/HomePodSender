@@ -27,6 +27,7 @@ const jobs = [
   { name: 'connecting', args: ['--state', 'connecting'], clip: PANEL },
   { name: 'failed', args: ['--state', 'failed'], clip: PANEL },
   { name: 'settings', args: ['--state', 'streaming', '--level', '0.6', '--sheet', 'settings'], clip: PANEL },
+  { name: 'audio-picker', args: ['--state', 'streaming', '--level', '0.6', '--sheet', 'audio'], clip: PANEL },
   { name: 'no-board', args: ['--state', 'streaming', '--level', '0.7', '--board', '0'], clip: PANEL },
   { name: 'intro-appear', args: ['--view', 'intro', '--t', '0.35'], clip: INTRO },
   { name: 'intro-hold', args: ['--view', 'intro', '--t', '1.0'], clip: INTRO },

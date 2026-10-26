@@ -8,7 +8,7 @@
 
 前端是 **Tauri 2 + React 19 + Vite 7**；Rust 外壳负责窗口、托盘、单实例与 sidecar 进程。AirPlay 协议、WASAPI 回环抓取与重采样仍由原来的 C#（`Ap2Core`）负责，通过 `Sidecar` 进程以 NDJSON over stdio 暴露给界面，协议和音频链路没有重写。
 
-> **下载**：[Releases](https://github.com/YFPS/HomePodSender/releases) —— 安装包（当前用户，无需管理员）或免安装 zip。
+> **下载**：[Releases](https://github.com/Miku0139oao/HomePodSender/releases) —— 安装包（当前用户，无需管理员）或免安装 zip。
 > 需要 Windows 10/11 x64、WebView2 运行时和 .NET 8 桌面运行时；从源码构建见下文。
 
 | 未播放 | 推流中 |
@@ -18,6 +18,10 @@
 | 连接中 | 设置（卡片翻面） |
 |---|---|
 | ![](shots/connecting.png) | ![](shots/settings.png) |
+
+| 音频来源（可选择声卡） |
+|---|
+| ![](shots/audio-picker.png) |
 
 | 关闭背景卡片（三张卡各自悬浮） |
 |---|
@@ -29,13 +33,14 @@
 
 ## 怎么用
 
-1. 从 [Releases](https://github.com/YFPS/HomePodSender/releases) 下 `HomePodSender_*_x64-setup.exe` 安装（当前用户，无需管理员），或解压免安装 zip 后直接运行 `HomePodSender\HomePodSender.exe`（需保留旁边的 `sidecar\HomePodSidecar.exe`）。
+1. 从 [Releases](https://github.com/Miku0139oao/HomePodSender/releases) 下 `HomePodSender_*_x64-setup.exe` 安装（当前用户，无需管理员），或解压免安装 zip 后直接运行 `HomePodSender\HomePodSender.exe`（需保留旁边的 `sidecar\HomePodSidecar.exe`）。
 2. 从开始菜单启动 HomePodSender。屏幕中央先出现光团，约 2 秒后飞到右下角，面板在任务栏上方展开。
 3. **左边高卡（AirPlay）**：点设备行选择要推流的 HomePod；「扫描设备」搜索局域网，「IP」手动添加。
 4. **右上卡（光球）**：轻点光球开始推流，再点一下断开。卡片下方显示设备名和推流时长。
 5. **右下卡（音量）**：点或拖动点阵调 **HomePod 的音量**，鼠标滚轮每格 ±2%，左边喇叭键一键静音 / 恢复。
-6. 点面板以外的地方或按 Esc，面板收回；**左键点托盘光球**可以再次打开或收起。右键托盘图标可连接、断开、打开日志文件夹或退出。
-7. 再次从开始菜单启动程序，不会开第二个实例，只会把面板唤出来。
+6. 设置面右上角可切换 **繁體中文 / English**；设置会保存在本机。
+7. 点面板以外的地方或按 Esc，面板收回；**左键点托盘光球**可以再次打开或收起。右键托盘图标可连接、断开、打开日志文件夹或退出。
+8. 再次从开始菜单启动程序，不会开第二个实例，只会把面板唤出来。
 
 > Windows 11 默认把新程序的托盘图标收进任务栏的「^」溢出区。想让光球一直显示在任务栏上：
 > 设置 → 个性化 → 任务栏 → 其他系统托盘图标 → 打开 HomePodSender。
@@ -59,9 +64,10 @@
 
 | 项 | 说明 |
 |---|---|
+| 音频 | 跟随 Windows 默认播放设备，或固定抓取指定播放端点（声卡 / 虚拟声卡）。播放中切换会自动重连 |
 | 断线自动重连 | 网络闪断或 HomePod 重启后自动重连 |
 | 启动时自动连接 | 默认关闭，避免一开机就出声 |
-| 播放延迟 | 点一下在 0.5 / 1 / 1.5 / 2 秒间切换。越大越抗网络抖动；看视频请选小一点。下次连接生效 |
+| 播放延迟 | 点一下在 0 / 0.1 / 0.25 / 0.5 / 1 / 1.5 / 2 秒间切换。越低越跟手，也越容易受网络抖动影响；0 秒为实验值。下次连接生效 |
 | 背景卡片 | 默认开启：三张卡片衬在一块圆角背景卡片上。关掉后背景卡片消失，三张卡片各自悬浮在桌面上（磨砂质感保留） |
 
 左上角的返回键翻回设备列表。
@@ -103,7 +109,7 @@
   通过 `listen('sidecar:event')` 收状态、20 Hz 电平和扫描进度。不开任何端口。
 - AirPlay 2 实时流：HAP 瞬时配对（SRP-6a 3072 / SHA-512）→ ChaCha20-Poly1305 加密 RTSP → NTP 授时 →
   未压缩 ALAC + ChaCha20 的 RTP 音频，每秒同步包，丢包重传，2 秒一次心跳。
-- 系统声音：WASAPI 回环抓取默认播放设备（跟随默认设备切换），96 抽头 Kaiser 窗 sinc 重采样到 44.1kHz，
+- 系统声音：WASAPI 回环可抓取默认播放设备或指定输出端点（声卡 / 虚拟声卡），96 抽头 Kaiser 窗 sinc 重采样到 44.1kHz，
   带漂移补偿；系统无声时自动补静音。
 - 设备发现不依赖多播 mDNS：扫描本机网段的 TCP 7000，读取 `/info`。立体声对角色看 TXT 的 `tsid`（同一对相同）、
   `igl`（自称组长）和 `pgid`（隶属上级分组）。同一对按整组裁决（`Discovery.ResolvePairs`）：一台自称组长且无 `pgid`、另一台自称成员且带 `pgid` 时才算成对，
@@ -122,7 +128,7 @@ npm install
 # 开发：tauri dev（自动构建 sidecar、启动 Vite、编译并打开应用）
 npm run dev
 
-# 只看界面：浏览器打开 http://127.0.0.1:5173/?preview=streaming （还有 idle / connecting / failed，&page=settings 翻面，
+# 只看界面：浏览器打开 http://127.0.0.1:5173/?preview=streaming （还有 idle / connecting / failed，&page=settings 翻面，&page=audio 看声卡选择，
 # ?view=intro&preview=1&t=1.0 看启动动画某一帧，?view=orbtest&bg=dark 看各状态光团）
 npm run dev:web
 
@@ -134,7 +140,7 @@ npm run e2e
 # 加 --shots 同时连拍桌面右下区域，核对真实桌面上的动画（输出 Desktop\shots\live\）
 node scripts/e2e.mjs --shots
 
-# 渲染 6 个面板状态（含关闭背景卡片）+ 3 帧启动动画到 ..\shots
+# 渲染 7 个面板状态（含声卡选择、关闭背景卡片）+ 3 帧启动动画到 ..\shots
 npm run shots
 
 # 立体声对实机检查：只读探测两台 /info，按实际报告检查选择成员时的行为（成对改连组长，未成对保持所选，均不连接、不出声）
@@ -175,8 +181,8 @@ dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll probe <IP> [<IP>…] [--txt]  
 
 ## 已知限制
 
-- 延迟 0.5–2 秒，不适合对口型的视频；音乐没问题。
-- 回环抓取的是“默认播放设备”的混音：电脑本机也会同时播放（耳机/音箱），不想听可在系统里把输出设备静音或调低。
+- 延迟可调 0–2 秒；低延迟更容易受 Wi-Fi 抖动影响，0 秒为实验值。音乐建议从 0.25–0.5 秒开始。
+- 回环抓取的是所选播放端点的混音：电脑本机也会同时播放（耳机/音箱），不想听可在系统里把该输出设备静音或调低。
 - 一次只连一个目标（立体声对算一个）；非立体声对的多房间同步播放暂未做。
 - 两台 HomePod 没有配成立体声对时，程序只能从所选的那一台出声；这由 Home App 里的立体声对状态决定，需要在那边修好。
 - 面板固定出现在**主显示器**右下角（任务栏在底部时）；任务栏放在侧边或顶部时位置会贴工作区右下角，但不一定靠着托盘。
