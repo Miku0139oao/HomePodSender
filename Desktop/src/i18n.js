@@ -153,7 +153,21 @@ function localizeDetail(language, detail) {
   const text = String(detail || '');
   if (language === 'en') {
     if (/选择的音频输出设备当前不可用/.test(text)) return 'The selected audio output is currently unavailable.';
+    if (/请输入有效的 IP 地址|无效的 IP 地址/.test(text)) return 'Please enter a valid IPv4 address.';
     if (/HomePod 无响应/.test(text)) return 'HomePod did not respond. Check the IP address and network.';
+    if (/核心进程已退出/.test(text)) return 'Core process exited unexpectedly.';
+    if (/核心进程尚未就绪/.test(text)) return 'Core process is not ready yet.';
+    if (/无法启动核心进程/.test(text)) return text.replace(/^无法启动核心进程[：:]?/, 'Failed to start core process: ');
+    if (/操作超时/.test(text)) return 'Operation timed out.';
+    if (/画面对齐服务没起来/.test(text)) return 'Video sync service failed to start.';
+    const vsOn = text.match(/对齐画面已打开.*晚\s*([0-9.]+)\s*秒/);
+    if (vsOn) return `Video sync enabled (${vsOn[1]}s). Keep this app running, then fully quit and reopen Chrome.`;
+    const vsManual = text.match(/加载文件夹\s*(.+?)\s*。/);
+    if (vsManual) return `Admin approval needed for auto-install. If cancelled, open chrome://extensions, enable Developer mode, and load ${vsManual[1]}.`;
+    if (/已关闭画面推迟/.test(text)) return 'Video sync disabled. Open tabs will recover immediately.';
+    if (/画面推迟已关掉，策略没删干净/.test(text)) return 'Video sync disabled, but browser policy cleanup needs admin approval.';
+    const unpairedOne = text.match(/未组立体声对，只会从\s*(\S+)\s*这一台出声/);
+    if (unpairedOne) return `Not grouped as a stereo pair; audio will play only on ${unpairedOne[1]}.`;
     const timeout = text.match(/流 SETUP 等待响应超时 \(?(\d+)ms\)?/i);
     if (timeout) return `Stream SETUP timed out (${timeout[1]} ms)`;
     return text;
@@ -172,7 +186,23 @@ function localizeDetail(language, detail) {
     .replace(/设备/g, '裝置')
     .replace(/音频/g, '音訊')
     .replace(/输出/g, '輸出')
-    .replace(/音乐/g, '音樂');
+    .replace(/音乐/g, '音樂')
+    .replace(/核心进程/g, '核心程序')
+    .replace(/请输入有效的/g, '請輸入有效的')
+    .replace(/无效的/g, '無效的')
+    .replace(/画面/g, '畫面')
+    .replace(/对齐/g, '對齊')
+    .replace(/推迟/g, '延遲')
+    .replace(/管理员/g, '管理員')
+    .replace(/确认/g, '確認')
+    .replace(/开发者模式/g, '開發人員模式')
+    .replace(/加载文件夹/g, '載入資料夾')
+    .replace(/网页/g, '網頁')
+    .replace(/声音/g, '聲音')
+    .replace(/立体声对/g, '立體聲對')
+    .replace(/未组/g, '未組成')
+    .replace(/打开/g, '開啟')
+    .replace(/关闭/g, '關閉');
 }
 
 export function localizeStatus(language, status) {

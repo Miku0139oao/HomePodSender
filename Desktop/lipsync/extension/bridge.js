@@ -1,25 +1,70 @@
-// 隔离世界：问后台要不要推迟、推迟多少，再告诉页面主世界。
-// 真正访问 127.0.0.1 的是扩展后台。网页是公网站点时，页面自己的请求会被浏览器拦住。
+// 隔离世界：向扩展后台查询是否开启画面推迟，并直接通知同在隔离世界的 main.js（不经过 window.postMessage）。
 (function () {
-  const url = 'http://127.0.0.1:17321/lipsync';
+  let timer = 0;
+  let stopped = false;
+
+  function notify(enabled, ms) {
+    if (typeof globalThis.__hpsLipUpdate === 'function') {
+      globalThis.__hpsLipUpdate(enabled, ms);
+    }
+  }
+
+  function stopPolling() {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = 0;
+    }
+    notify(false, 500);
+  }
+
+  function schedule(ms) {
+    if (stopped) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(poll, ms);
+  }
+
   async function poll() {
+    timer = 0;
+    if (stopped) return;
+    if (document.hidden) {
+      notify(false, 500);
+      return;
+    }
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+      stopPolling();
+      return;
+    }
+    // 没有视频元素时降低轮询频率，避免所有空标签页持续唤醒 Service Worker
+    const hasVideo = !!document.querySelector('video');
     let enabled = false;
     let ms = 500;
     try {
-      let j = null;
-      if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
-        j = await chrome.runtime.sendMessage({ source: 'hps-lip-ask' });
-      } else {
-        const r = await fetch(url, { cache: 'no-store' });
-        if (r.ok) j = await r.json();
-      }
+      const j = await chrome.runtime.sendMessage({ source: 'hps-lip-ask' });
       if (j) {
         enabled = !!j.enabled;
-        ms = j.ms;
+        if (Number.isFinite(Number(j.ms))) ms = Number(j.ms);
       }
-    } catch { /* 程序没开或后台刚睡醒：这一拍先恢复原画 */ }
-    window.postMessage({ source: 'hps-lip', enabled: enabled, ms: ms }, '*');
+    } catch (err) {
+      const msg = String(err && err.message || err || '');
+      if (msg.includes('Extension context invalidated') || !chrome.runtime.id) {
+        stopPolling();
+        return;
+      }
+    }
+    notify(enabled, ms);
+    schedule(hasVideo || enabled ? 1000 : 3000);
   }
+
+  document.addEventListener('visibilitychange', () => {
+    if (stopped) return;
+    if (document.hidden) {
+      if (timer) { clearTimeout(timer); timer = 0; }
+      notify(false, 500);
+    } else {
+      poll();
+    }
+  });
+
   poll();
-  setInterval(poll, 1000);
 })();

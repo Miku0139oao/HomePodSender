@@ -182,7 +182,16 @@ public sealed class Ap2Session : IDisposable
         {
             cts.CancelAfter(5000);
             try { await sock.ConnectAsync(new IPEndPoint(_ip, _o.Port), cts.Token).ConfigureAwait(false); }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { sock.Dispose(); throw new TimeoutException("连接 " + _o.Ip + ":" + _o.Port + " 超时"); }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                sock.Dispose();
+                throw new TimeoutException("连接 " + _o.Ip + ":" + _o.Port + " 超时");
+            }
+            catch
+            {
+                sock.Dispose();
+                throw;
+            }
         }
         _localIp = ((IPEndPoint)sock.LocalEndPoint!).Address;
         Log("TCP 已连接 " + _o.Ip + ":" + _o.Port + "，本机地址 " + _localIp);
@@ -347,7 +356,7 @@ public sealed class Ap2Session : IDisposable
         var msg = mem.Span;
         if (msg.Length < 8 || (msg[1] & 0x7F) != 0x55) return;
         ushort seq = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(msg.Slice(4));
-        int n = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(msg.Slice(6));
+        int n = Math.Min((int)System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(msg.Slice(6)), Backlog);
         Interlocked.Add(ref RetransRequests, n);
         for (int i = 0; i < n; i++)
         {
@@ -356,7 +365,11 @@ public sealed class Ap2Session : IDisposable
             lock (_backlogLock)
             {
                 int slot = s & (Backlog - 1);
-                if (_backlogSeq[slot] == s) copy = _backlog[slot];
+                if (_backlogSeq[slot] == s && _backlog[slot] != null)
+                {
+                    copy = new byte[_backlog[slot].Length];
+                    Buffer.BlockCopy(_backlog[slot], 0, copy, 0, copy.Length);
+                }
             }
             if (copy == null) continue;
             var resp = new byte[4 + copy.Length];
@@ -373,7 +386,7 @@ public sealed class Ap2Session : IDisposable
         ulong curNtp = NtpClock.TsToNtp(_startNtpTs + (ulong)_framesSent, Rate);
         uint now = unchecked((uint)(_o.LatencyFrames + _framesSent));
         var pkt = Rtp.SyncPacket(first, unchecked(now - (uint)_o.LatencyFrames), curNtp, now);
-        _ctrl!.SendTo(pkt, _ctrlEp!);
+        _ctrl?.SendTo(pkt, _ctrlEp!);
         SyncPackets++;
     }
 
@@ -382,8 +395,11 @@ public sealed class Ap2Session : IDisposable
         _source!.Read(_pcm, Frames);
         Alac.Pack(_pcm, Frames, _alac);
         uint rtptime = unchecked((uint)(_o.LatencyFrames + _framesSent));
-        int len = Rtp.AudioPacket(_audioCipher!, _audioCtr++, _first, _seq, rtptime, _sessionId, _alac, _pkt);
-        _audio!.SendTo(_pkt.AsSpan(0, len), _dataEp!);
+        var cipher = _audioCipher;
+        var audio = _audio;
+        if (cipher == null || audio == null) return;
+        int len = Rtp.AudioPacket(cipher, _audioCtr++, _first, _seq, rtptime, _sessionId, _alac, _pkt);
+        audio.SendTo(_pkt.AsSpan(0, len), _dataEp!);
         lock (_backlogLock)
         {
             int slot = _seq & (Backlog - 1);
@@ -432,7 +448,8 @@ public sealed class Ap2Session : IDisposable
 
     void StreamLoop()
     {
-        timeBeginPeriod(1);
+        bool hiRes = OperatingSystem.IsWindows();
+        if (hiRes) timeBeginPeriod(1);
         try
         {
             var sw = Stopwatch.StartNew();
@@ -449,7 +466,7 @@ public sealed class Ap2Session : IDisposable
             }
         }
         catch (Exception e) { Log("推流线程异常: " + e.Message); RaiseDisconnected("推流线程异常: " + e.Message); }
-        finally { timeEndPeriod(1); }
+        finally { if (hiRes) timeEndPeriod(1); }
     }
 
     /// <summary>每 2 秒一次 POST /feedback 作为心跳；连续 3 次失败视为断开</summary>
@@ -484,9 +501,9 @@ public sealed class Ap2Session : IDisposable
     public async Task StopAsync()
     {
         _stop = true;
-        _feedbackCts?.Cancel();
-        _thread?.Join(1500);
-        _thread = null;
+        try { _feedbackCts?.Cancel(); } catch { }
+        var t = Interlocked.Exchange(ref _thread, null);
+        if (t != null && t != Thread.CurrentThread) t.Join(1500);
         try
         {
             if (_conn is { IsClosed: false } && _sessionUrl != "")
@@ -503,11 +520,19 @@ public sealed class Ap2Session : IDisposable
     public void Dispose()
     {
         _stop = true;
-        _feedbackCts?.Cancel();
         Interlocked.Exchange(ref _disconnectedRaised, 1);   // 主动关闭不再触发断开事件
+        var cts = Interlocked.Exchange(ref _feedbackCts, null);
+        try { cts?.Cancel(); cts?.Dispose(); } catch { }
+        var t = Interlocked.Exchange(ref _thread, null);
+        if (t != null && t != Thread.CurrentThread) t.Join(1500);
         _timing?.Dispose(); _ctrl?.Dispose(); _audio?.Dispose();
         _events?.Dispose();
         _conn?.Dispose();
+        _audioCipher?.Dispose();
         _timing = _ctrl = _audio = null;
+        _events = null;
+        _conn = null;
+        _audioCipher = null;
+        try { _rtspLock.Dispose(); } catch { }
     }
 }

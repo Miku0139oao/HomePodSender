@@ -381,56 +381,62 @@ sealed class FakeReceiver : IDisposable
         catch { }
     }
 
+    readonly object _audioLock = new();
+
     void ProcessAudio(byte[] p, bool retransmitted)
     {
         if (p.Length < 12 + 16 + 8) return;
         ushort seq = BinaryPrimitives.ReadUInt16BigEndian(p.AsSpan(2));
         uint rtp = BinaryPrimitives.ReadUInt32BigEndian(p.AsSpan(4));
-        if (!retransmitted)
+        lock (_audioLock)
         {
-            if (DropEvery > 0 && seq % DropEvery == 7 && !_dropped.Contains(seq))
+            if (!retransmitted)
             {
-                // 模拟丢包：丢弃本包，向客户端发重传请求
-                _dropped.Add(seq);
-                var rq = new byte[8];
-                rq[0] = 0x80; rq[1] = 0xD5; rq[3] = 1;
-                BinaryPrimitives.WriteUInt16BigEndian(rq.AsSpan(4), seq);
-                BinaryPrimitives.WriteUInt16BigEndian(rq.AsSpan(6), 1);
-                _ = _control!.SendAsync(rq, new IPEndPoint(_clientIp, _clientControlPort));
-                return;
+                if (DropEvery > 0 && seq % DropEvery == 7 && !_dropped.Contains(seq))
+                {
+                    // 模拟丢包：丢弃本包，向客户端发重传请求
+                    _dropped.Add(seq);
+                    var rq = new byte[8];
+                    rq[0] = 0x80; rq[1] = 0xD5; rq[3] = 1;
+                    BinaryPrimitives.WriteUInt16BigEndian(rq.AsSpan(4), seq);
+                    BinaryPrimitives.WriteUInt16BigEndian(rq.AsSpan(6), 1);
+                    _ = _control!.SendAsync(rq, new IPEndPoint(_clientIp, _clientControlPort));
+                    return;
+                }
+                if (_haveLast)
+                {
+                    // 相邻包的序号差应为 1；刚丢过一个包时为 2。RTP 时间戳每包增加 352。
+                    int gap = (ushort)(seq - _lastSeq);
+                    bool okGap = gap == 1 || (gap == 2 && _dropped.Contains((ushort)(_lastSeq + 1)));
+                    if (!okGap) OrderErrors++;
+                    if (rtp - _lastRtp != 352u * (uint)gap) RtpStepErrors++;
+                }
+                _lastSeq = seq; _lastRtp = rtp; _haveLast = true;
             }
-            if (_haveLast)
-            {
-                // 相邻包的序号差应为 1；刚丢过一个包时为 2。RTP 时间戳每包增加 352。
-                int gap = (ushort)(seq - _lastSeq);
-                bool okGap = gap == 1 || (gap == 2 && _dropped.Contains((ushort)(_lastSeq + 1)));
-                if (!okGap) OrderErrors++;
-                if (rtp - _lastRtp != 352u * (uint)gap) RtpStepErrors++;
-            }
-            _lastSeq = seq; _lastRtp = rtp; _haveLast = true;
-        }
-        else RetransRecovered++;
+            else RetransRecovered++;
 
-        // 解密：nonce = 4 个 0 + 尾部 8 字节；AAD = 头部第 4..12 字节
-        int n = p.Length - 12 - 16 - 8;
-        var nonce = new byte[12];
-        p.AsSpan(p.Length - 8, 8).CopyTo(nonce.AsSpan(4));
-        var pt = new byte[n];
-        try
-        {
-            using var c = new ChaCha20Poly1305(_audioKey!.AsSpan(0, 32).ToArray());
-            c.Decrypt(nonce, p.AsSpan(12, n), p.AsSpan(12 + n, 16), pt, p.AsSpan(4, 8));
+            // 解密：nonce = 4 个 0 + 尾部 8 字节；AAD = 头部第 4..12 字节
+            int n = p.Length - 12 - 16 - 8;
+            var nonce = new byte[12];
+            p.AsSpan(p.Length - 8, 8).CopyTo(nonce.AsSpan(4));
+            var pt = new byte[n];
+            try
+            {
+                using var c = new ChaCha20Poly1305(_audioKey!.AsSpan(0, 32).ToArray());
+                c.Decrypt(nonce, p.AsSpan(12, n), p.AsSpan(12 + n, 16), pt, p.AsSpan(4, 8));
+            }
+            catch (CryptographicException) { DecryptFailures++; return; }
+            if (FirstSeq < 0) FirstSeq = seq;
+            var decoded = DecodeAlac(pt);
+            foreach (short v in decoded) { int av = Math.Abs((int)v); if (av > MaxAbsSample) MaxAbsSample = av; }
+            Pcm[seq] = decoded;
+            AudioPackets++;
         }
-        catch (CryptographicException) { DecryptFailures++; return; }
-        if (FirstSeq < 0) FirstSeq = seq;
-        var decoded = DecodeAlac(pt);
-        foreach (short v in decoded) { int av = Math.Abs((int)v); if (av > MaxAbsSample) MaxAbsSample = av; }
-        Pcm[seq] = decoded;
-        AudioPackets++;
     }
 
     static short[] DecodeAlac(byte[] d)
     {
+        if (d.Length * 8 < 23 + 352 * 32) return Array.Empty<short>();
         int bit = 0;
         int Get(int k) { int v = 0; for (int i = 0; i < k; i++) { v = (v << 1) | ((d[bit >> 3] >> (7 - (bit & 7))) & 1); bit++; } return v; }
         if (Get(3) != 1 || Get(4) != 0 || Get(12) != 0 || Get(1) != 0 || Get(2) != 0 || Get(1) != 1) return Array.Empty<short>();
@@ -445,6 +451,10 @@ sealed class FakeReceiver : IDisposable
         try { _listener.Stop(); } catch { }
         try { _eventListener?.Stop(); } catch { }
         try { _client?.Close(); } catch { }
-        foreach (var r in _res) { try { r.Dispose(); } catch { } }
+        lock (_res)
+        {
+            foreach (var r in _res) { try { r.Dispose(); } catch { } }
+            _res.Clear();
+        }
     }
 }

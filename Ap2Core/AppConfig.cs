@@ -49,12 +49,6 @@ public sealed class AppConfig
         catch { cfg = new AppConfig(); }
         if (string.IsNullOrEmpty(cfg.DeviceId))
             cfg.DeviceId = "02:" + string.Join(":", RandomNumberGenerator.GetBytes(5).Select(b => b.ToString("X2")));
-        if (cfg.Devices.Count == 0 && string.IsNullOrEmpty(cfg.Ip))
-        {
-            // 首次运行：预置本机已知的 HomePod（立体声对的组长）
-            cfg.Devices.Add(new DeviceEntry { Name = "起居室 (2)", Ip = "192.168.50.71", Role = "组长" });
-            cfg.Ip = "192.168.50.71";
-        }
         cfg.VolumePercent = Math.Clamp(cfg.VolumePercent, 0, 100);
         cfg.LatencyMs = Math.Clamp(cfg.LatencyMs, 0, 2000);
         return cfg;

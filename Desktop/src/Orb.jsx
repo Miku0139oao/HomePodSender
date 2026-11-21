@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 /*
  * Siri 光团（WebGL）。
@@ -102,13 +102,35 @@ export function orbClock() {
 
 export default function Orb({
   size, color = 1, energy = 0, energyRef = null, colorRef = null, radius = 0.74, still = false, stillTime = 1.7,
-  className = '', style = undefined,
+  paused = false, className = '', style = undefined,
 }) {
   const canvasRef = useRef(null);
   const live = useRef({ color, energy, targetColor: color, targetEnergy: energy });
+  const drawOnceRef = useRef(null);
+  const [ctxEpoch, setCtxEpoch] = useState(0);
 
-  useEffect(() => { live.current.targetColor = color; }, [color]);
-  useEffect(() => { live.current.targetEnergy = energy; }, [energy]);
+  useEffect(() => {
+    live.current.targetColor = color;
+    if (still && !paused) drawOnceRef.current?.();
+  }, [color, still, paused]);
+
+  useEffect(() => {
+    live.current.targetEnergy = energy;
+    if (still && !paused) drawOnceRef.current?.();
+  }, [energy, still, paused]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const onLost = (e) => { e.preventDefault(); };
+    const onRestored = () => { setCtxEpoch((n) => n + 1); };
+    canvas.addEventListener('webglcontextlost', onLost);
+    canvas.addEventListener('webglcontextrestored', onRestored);
+    return () => {
+      canvas.removeEventListener('webglcontextlost', onLost);
+      canvas.removeEventListener('webglcontextrestored', onRestored);
+    };
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -119,14 +141,23 @@ export default function Orb({
     const gl = canvas.getContext('webgl', { alpha: true, premultipliedAlpha: true, antialias: true });
     if (!gl) return undefined;
 
-    let prog;
+    let prog = null;
+    let vs = null;
+    let fs = null;
     try {
+      vs = compile(gl, gl.VERTEX_SHADER, VERT);
+      fs = compile(gl, gl.FRAGMENT_SHADER, FRAG);
       prog = gl.createProgram();
-      gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
-      gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
       gl.linkProgram(prog);
+      gl.deleteShader(vs); vs = null;
+      gl.deleteShader(fs); fs = null;
       if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog) || 'link failed');
     } catch (err) {
+      if (vs) gl.deleteShader(vs);
+      if (fs) gl.deleteShader(fs);
+      if (prog) gl.deleteProgram(prog);
       console.error('[orb]', err);
       return undefined;
     }
@@ -143,7 +174,8 @@ export default function Orb({
     gl.clearColor(0, 0, 0, 0);
 
     let raf = 0;
-    const draw = () => {
+    const renderFrame = () => {
+      if (gl.isContextLost()) return;
       const s = live.current;
       if (energyRef) s.targetEnergy = Math.max(0, Math.min(1, energyRef.current || 0));
       // colorRef 由调用方逐帧精确控制（启动动画用），否则按目标值平滑过渡
@@ -157,15 +189,22 @@ export default function Orb({
       gl.uniform1f(uEnergy, s.energy);
       gl.uniform1f(uRadius, radius);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-      if (!still) raf = requestAnimationFrame(draw);
     };
-    draw();
+    const draw = () => {
+      renderFrame();
+      if (!still && !paused) raf = requestAnimationFrame(draw);
+    };
+    drawOnceRef.current = renderFrame;
+    if (!paused) draw();
     return () => {
+      drawOnceRef.current = null;
       cancelAnimationFrame(raf);
-      gl.deleteBuffer(buf);
-      gl.deleteProgram(prog);
+      if (!gl.isContextLost()) {
+        gl.deleteBuffer(buf);
+        gl.deleteProgram(prog);
+      }
     };
-  }, [size, radius, still, stillTime, energyRef, colorRef]);
+  }, [size, radius, still, stillTime, paused, energyRef, colorRef, ctxEpoch]);
 
   return <canvas ref={canvasRef} className={className} style={{ width: size, height: size, ...style }} />;
 }

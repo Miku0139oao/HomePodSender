@@ -215,8 +215,8 @@ public static class Discovery
         if (paired) return new List<string> { group.First(d => d.Role == "组长" && !d.Unpaired).Ip };
         if (group.Count == 2 && group.All(d => d.Unpaired))
         {
-            var other = group.First(d => d.Ip != selectedIp).Ip;
-            return new List<string> { selectedIp, other };
+            var other = group.FirstOrDefault(d => d.Ip != selectedIp)?.Ip;
+            if (!string.IsNullOrEmpty(other)) return new List<string> { selectedIp, other };
         }
         return new List<string> { selectedIp };
     }

@@ -33,10 +33,26 @@ public sealed class RtspConn : IDisposable
         _ = Task.Run(ReadLoop);
     }
 
+    const int MaxBodyLength = 16 * 1024 * 1024;
+    const int MaxHeaderLength = 64 * 1024;
+
+    static void SendAll(Socket sock, ReadOnlySpan<byte> data)
+    {
+        int sent = 0;
+        while (sent < data.Length)
+        {
+            int n = sock.Send(data.Slice(sent));
+            if (n <= 0) throw new IOException("套接字发送中断");
+            sent += n;
+        }
+    }
+
     public void EnableEncryption(byte[] writeKey, byte[] readKey)
     {
         lock (_lock)
         {
+            _writer?.Dispose();
+            _reader?.Dispose();
             _writer = new FrameWriter(writeKey);
             _reader = new FrameReader(readKey);
         }
@@ -92,14 +108,21 @@ public sealed class RtspConn : IDisposable
         for (;;)
         {
             int i = IndexOfHeaderEnd(_rx);
-            if (i < 0) return;
+            if (i < 0)
+            {
+                if (_rx.Length > MaxHeaderLength) throw new IOException(_name + " 响应头过大");
+                return;
+            }
             string head = Encoding.Latin1.GetString(_rx, 0, i);
             int clen = 0;
             foreach (var line in head.Split("\r\n").Skip(1))
             {
                 int c = line.IndexOf(':');
                 if (c > 0 && line.AsSpan(0, c).Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
-                    int.TryParse(line.AsSpan(c + 1).Trim(), out clen);
+                {
+                    if (!int.TryParse(line.AsSpan(c + 1).Trim(), out clen) || clen < 0 || clen > MaxBodyLength)
+                        throw new IOException(_name + " Content-Length 无效");
+                }
             }
             if (_rx.Length < i + 4 + clen) return;
             var body = _rx.AsSpan(i + 4, clen).ToArray();
@@ -124,29 +147,50 @@ public sealed class RtspConn : IDisposable
     public async Task<RtspResponse> ExchangeAsync(byte[] raw, string label, int timeoutMs = 8000)
     {
         var tcs = new TaskCompletionSource<RtspResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        byte[] wire;
         lock (_lock)
         {
             if (_closed != null) throw _closed;
             _waiters.Enqueue(tcs);
-            var wire = _writer != null ? _writer.Encrypt(raw) : raw;
-            try { _sock.Send(wire); }
-            catch (Exception e) { _waiters.Clear(); Fail(e); throw; }
+            wire = _writer != null ? _writer.Encrypt(raw) : raw;
         }
-        var done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)).ConfigureAwait(false);
-        if (done != tcs.Task) throw new TimeoutException(label + " 等待响应超时 (" + timeoutMs + "ms)");
+        try { SendAll(_sock, wire); }
+        catch (Exception e) { Fail(e); throw; }
+
+        using var cts = new CancellationTokenSource(timeoutMs);
+        var delay = Task.Delay(Timeout.Infinite, cts.Token);
+        var done = await Task.WhenAny(tcs.Task, delay).ConfigureAwait(false);
+        if (done != tcs.Task)
+        {
+            // RTSP 请求/响应严格按序，单次超时后必须断开连接避免后续响应永久错位
+            var err = new TimeoutException(label + " 等待响应超时 (" + timeoutMs + "ms)");
+            Fail(err);
+            Dispose();
+            throw err;
+        }
+        cts.Cancel();
         return await tcs.Task.ConfigureAwait(false);
     }
 
     public void Dispose()
     {
         try { _sock.Shutdown(SocketShutdown.Both); } catch { }
+        try { _ns.Dispose(); } catch { }
         try { _sock.Close(); } catch { }
+        lock (_lock)
+        {
+            _writer?.Dispose(); _writer = null;
+            _reader?.Dispose(); _reader = null;
+        }
     }
 }
 
 /// <summary>事件通道：接收端主动推送加密请求，必须回最小的 200 OK，否则会中途断开</summary>
 public sealed class EventChannel : IDisposable
 {
+    const int MaxBodyLength = 4 * 1024 * 1024;
+    const int MaxHeaderLength = 64 * 1024;
+
     readonly Socket _sock;
     readonly FrameReader _reader;
     readonly FrameWriter _writer;
@@ -161,6 +205,17 @@ public sealed class EventChannel : IDisposable
         _writer = new FrameWriter(outKey);
         _log = log;
         _ = Task.Run(ReadLoop);
+    }
+
+    static void SendAll(Socket sock, ReadOnlySpan<byte> data)
+    {
+        int sent = 0;
+        while (sent < data.Length)
+        {
+            int n = sock.Send(data.Slice(sent));
+            if (n <= 0) throw new IOException("事件通道发送中断");
+            sent += n;
+        }
     }
 
     async Task ReadLoop()
@@ -191,23 +246,31 @@ public sealed class EventChannel : IDisposable
             int i = -1;
             for (int k = 0; k + 3 < _rx.Length; k++)
                 if (_rx[k] == 13 && _rx[k + 1] == 10 && _rx[k + 2] == 13 && _rx[k + 3] == 10) { i = k; break; }
-            if (i < 0) return;
+            if (i < 0)
+            {
+                if (_rx.Length > MaxHeaderLength) throw new IOException("事件通道请求头过大");
+                return;
+            }
             string head = Encoding.Latin1.GetString(_rx, 0, i);
             var cl = System.Text.RegularExpressions.Regex.Match(head, @"Content-Length:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            int clen = cl.Success ? int.Parse(cl.Groups[1].Value) : 0;
+            int clen = 0;
+            if (cl.Success && (!int.TryParse(cl.Groups[1].Value, out clen) || clen < 0 || clen > MaxBodyLength))
+                throw new IOException("事件通道 Content-Length 无效");
             if (_rx.Length < i + 4 + clen) return;
             _rx = _rx.AsSpan(i + 4 + clen).ToArray();
             _count++;
             if (_count <= 3) _log("[事件通道] 收到: " + head.Split("\r\n")[0]);
             var cs = System.Text.RegularExpressions.Regex.Match(head, @"CSeq:\s*(\d+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
             string resp = "RTSP/1.0 200 OK\r\nServer: AirTunes/670.6.2\r\n" + (cs.Success ? "CSeq: " + cs.Groups[1].Value + "\r\n" : "") + "\r\n";
-            try { _sock.Send(_writer.Encrypt(Encoding.Latin1.GetBytes(resp))); } catch { }
+            try { SendAll(_sock, _writer.Encrypt(Encoding.Latin1.GetBytes(resp))); } catch { }
         }
     }
 
     public void Dispose()
     {
         try { _sock.Close(); } catch { }
+        try { _reader.Dispose(); } catch { }
+        try { _writer.Dispose(); } catch { }
     }
 }
 

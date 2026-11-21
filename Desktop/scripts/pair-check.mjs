@@ -10,7 +10,11 @@ import { repo } from './cdp.mjs';
  * 再选择成员那台：成对时应改连组长，未成对时应保持所选设备（不替它猜）。
  * 用法：node scripts/pair-check.mjs <组长IP> <成员IP>
  */
-const [leaderIp = '192.168.50.71', memberIp = '192.168.50.23'] = process.argv.slice(2);
+const [leaderIp, memberIp] = process.argv.slice(2);
+if (!leaderIp || !memberIp) {
+  console.error('用法：node scripts/pair-check.mjs <组长IP> <成员IP>');
+  process.exit(2);
+}
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hps-pair-'));
 // 旧版本可能留下的“两台都是组长”配置；新版应以 HomePod 实际报告为准
 fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({

@@ -17,6 +17,8 @@ public sealed class PcmBus
 
     public PcmBus(IAudioSource inner, int frames = Ap2Session.Frames)
     {
+        ArgumentNullException.ThrowIfNull(inner);
+        if (frames <= 0) throw new ArgumentOutOfRangeException(nameof(frames));
         _inner = inner;
         _frames = frames;
         _ring = new short[Blocks * frames * 2];
@@ -31,7 +33,7 @@ public sealed class PcmBus
         int samples = frames * 2;
         lock (_gate)
         {
-            if (cursor < _head - Blocks) cursor = _head;
+            if (cursor < 0 || cursor > _head || cursor < _head - Blocks) cursor = _head;
             if (cursor == _head)
             {
                 int slot = (int)(_head % Blocks);

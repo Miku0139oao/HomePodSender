@@ -8,9 +8,11 @@ import Panel from './Panel.jsx';
 import Intro from './Intro.jsx';
 import Orb from './Orb.jsx';
 
-// The panel is an application surface, not a web page: never expose WebView2's
-// browser/reload/save context menu to the user.
+// The panel is an application surface, not a web page: suppress WebView2's
+// browser context menu except on editable inputs so paste works.
 window.addEventListener('contextmenu', (event) => {
+  const tag = event.target?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
   event.preventDefault();
   event.stopPropagation();
 }, { capture: true });
@@ -29,7 +31,9 @@ if (zoom > 1) {
 
 function OrbTest() {
   // ?bg=dark / light 切换底色，检查光团在深浅桌面上的效果
-  document.documentElement.dataset.bg = new URLSearchParams(window.location.search).get('bg') || 'warm';
+  React.useEffect(() => {
+    document.documentElement.dataset.bg = new URLSearchParams(window.location.search).get('bg') || 'warm';
+  }, []);
   const language = readLanguage();
   const t = (key) => translate(language, key);
   const cells = [

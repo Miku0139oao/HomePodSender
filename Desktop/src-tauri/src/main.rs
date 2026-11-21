@@ -6,13 +6,14 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -25,8 +26,28 @@ const ORB_Y: f64 = 110.0;
 const ORB_SIZE: f64 = 132.0;
 const TRAY_PX: u32 = 32;
 
+const ALLOWED_SIDECAR_CMDS: &[&str] = &[
+    "state",
+    "connect",
+    "disconnect",
+    "setVolume",
+    "setLatency",
+    "setAudioDevice",
+    "refreshAudioDevices",
+    "setOptions",
+    "selectDevice",
+    "addDevice",
+    "scan",
+    "cancelScan",
+    "refreshDevices",
+];
+
+fn lock_unpoison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 struct SidecarState {
-    stdin: Mutex<Option<ChildStdin>>,
+    tx: Arc<Mutex<Option<SyncSender<String>>>>,
     child: Mutex<Option<Child>>,
     pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>>,
     next_id: AtomicU64,
@@ -41,18 +62,25 @@ struct TrayItems {
     tray: TrayIcon<tauri::Wry>,
 }
 
+struct TrayText {
+    language: String,
+    last_status: String,
+}
+
 /// 面板与托盘的共享状态
 struct UiState {
     visible: AtomicBool,
     hiding: AtomicBool,
-    last_hide: Mutex<Instant>,
+    hide_gen: AtomicU64,
+    last_hide: Mutex<Option<Instant>>,
     /// 0 = 未播放，1 = 连接中/重连中，2 = 播放中
     stream: AtomicU8,
     /// 最近的声音电平（f32 位模式）
     level: AtomicU32,
     intro_running: AtomicBool,
-    language: Mutex<String>,
-    last_status: Mutex<String>,
+    exiting: AtomicBool,
+    anim_wake: Arc<(Mutex<bool>, Condvar)>,
+    tray_text: Mutex<TrayText>,
 }
 
 impl UiState {
@@ -60,19 +88,32 @@ impl UiState {
         Self {
             visible: AtomicBool::new(false),
             hiding: AtomicBool::new(false),
-            last_hide: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hide_gen: AtomicU64::new(0),
+            last_hide: Mutex::new(None),
             stream: AtomicU8::new(0),
             level: AtomicU32::new(0f32.to_bits()),
             intro_running: AtomicBool::new(false),
-            language: Mutex::new("zh-TW".into()),
-            last_status: Mutex::new(String::new()),
+            exiting: AtomicBool::new(false),
+            anim_wake: Arc::new((Mutex::new(false), Condvar::new())),
+            tray_text: Mutex::new(TrayText {
+                language: "zh-TW".into(),
+                last_status: String::new(),
+            }),
         }
+    }
+
+    fn wake_animator(&self) {
+        let (lock, cvar) = &*self.anim_wake;
+        let mut active = lock_unpoison(lock);
+        *active = true;
+        cvar.notify_all();
     }
 }
 
 // ======================= 核心进程（sidecar） =======================
 
 fn sidecar_path(app: &AppHandle) -> PathBuf {
+    #[cfg(debug_assertions)]
     if let Ok(p) = std::env::var("HPS_SIDECAR") {
         return PathBuf::from(p);
     }
@@ -88,7 +129,7 @@ fn sidecar_path(app: &AppHandle) -> PathBuf {
 
 fn empty_sidecar() -> SidecarState {
     SidecarState {
-        stdin: Mutex::new(None),
+        tx: Arc::new(Mutex::new(None)),
         child: Mutex::new(None),
         pending: Arc::new(Mutex::new(HashMap::new())),
         next_id: AtomicU64::new(1),
@@ -110,9 +151,30 @@ fn start_sidecar(app: &AppHandle) -> SidecarState {
         }
     };
 
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take().expect("sidecar stdout");
-    let stderr = child.stderr.take().expect("sidecar stderr");
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = app.emit("sidecar:event", json!({ "ev": "error", "message": "核心进程管道初始化失败" }));
+        return empty_sidecar();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = app.emit("sidecar:event", json!({ "ev": "error", "message": "核心进程管道初始化失败" }));
+        return empty_sidecar();
+    };
+    let stderr = child.stderr.take();
+
+    // 独立写入线程，避免同步管道写阻塞 Tokio 工作线程或 Windows UI/托盘事件循环
+    let (write_tx, write_rx) = mpsc::sync_channel::<String>(64);
+    let tx_slot = Arc::new(Mutex::new(Some(write_tx)));
+    let tx_for_reader = Arc::clone(&tx_slot);
+    std::thread::spawn(move || {
+        while let Ok(line) = write_rx.recv() {
+            if stdin.write_all(line.as_bytes()).is_err() {
+                break;
+            }
+            let _ = stdin.flush();
+        }
+    });
 
     let pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -143,7 +205,7 @@ fn start_sidecar(app: &AppHandle) -> SidecarState {
             } else if let Some(id) = value.get("id").and_then(Value::as_u64) {
                 let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
                 let payload = value.get("payload").cloned().unwrap_or(Value::Null);
-                if let Some(tx) = pending_reader.lock().unwrap().remove(&id) {
+                if let Some(tx) = lock_unpoison(&pending_reader).remove(&id) {
                     let result = if ok {
                         Ok(payload)
                     } else {
@@ -153,17 +215,26 @@ fn start_sidecar(app: &AppHandle) -> SidecarState {
                 }
             }
         }
+        // 核心进程已退出：立刻关闭写入端并通知所有等待中的调用，避免死等 35 秒超时
+        lock_unpoison(&tx_for_reader).take();
+        let drained: Vec<_> = lock_unpoison(&pending_reader).drain().collect();
+        for (_, waiter) in drained {
+            let _ = waiter.send(Err("核心进程已退出".into()));
+        }
+        update_tray_state(&app_reader, "Disconnected", "核心进程已退出");
         let _ = app_reader.emit("sidecar:event", json!({ "ev": "error", "message": "核心进程已退出" }));
     });
 
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().flatten() {
-            eprintln!("[sidecar] {line}");
-        }
-    });
+    if let Some(stderr) = stderr {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().flatten() {
+                eprintln!("[sidecar] {line}");
+            }
+        });
+    }
 
     SidecarState {
-        stdin: Mutex::new(stdin),
+        tx: tx_slot,
         child: Mutex::new(Some(child)),
         pending,
         next_id: AtomicU64::new(1),
@@ -171,15 +242,23 @@ fn start_sidecar(app: &AppHandle) -> SidecarState {
 }
 
 fn write_message(state: &SidecarState, cmd: &str, payload: Value, id: u64) -> Result<(), String> {
-    let mut msg = if payload.is_object() { payload } else { json!({}) };
+    if !payload.is_object() {
+        return Err("无效的请求参数".into());
+    }
+    let mut msg = payload;
     msg["id"] = json!(id);
     msg["cmd"] = json!(cmd);
     let line = serde_json::to_string(&msg).map_err(|e| e.to_string())? + "\n";
-    let mut guard = state.stdin.lock().unwrap();
-    let stdin = guard.as_mut().ok_or("核心进程尚未就绪")?;
-    stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    let _ = stdin.flush();
-    Ok(())
+    if line.len() > 64 * 1024 {
+        return Err("请求过大".into());
+    }
+    let guard = lock_unpoison(&state.tx);
+    let tx = guard.as_ref().ok_or("核心进程尚未就绪")?;
+    match tx.try_send(line) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err("核心进程繁忙，请稍后再试".into()),
+        Err(TrySendError::Disconnected(_)) => Err("核心进程已退出".into()),
+    }
 }
 
 fn write_fire(app: &AppHandle, cmd: &str, payload: Value) {
@@ -192,17 +271,31 @@ fn write_fire(app: &AppHandle, cmd: &str, payload: Value) {
 // ======================= 前端可调用的命令 =======================
 
 #[tauri::command]
-async fn sidecar_call(cmd: String, payload: Option<Value>, state: State<'_, SidecarState>) -> Result<Value, String> {
+async fn sidecar_call(
+    window: tauri::WebviewWindow,
+    cmd: String,
+    payload: Option<Value>,
+    state: State<'_, SidecarState>,
+) -> Result<Value, String> {
+    if !ALLOWED_SIDECAR_CMDS.contains(&cmd.as_str()) {
+        return Err(format!("不允许的命令：{cmd}"));
+    }
+    if window.label() == "intro" && cmd != "state" {
+        return Err("启动窗口无权调用该命令".into());
+    }
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state.pending.lock().unwrap().insert(id, tx);
-    write_message(&state, &cmd, payload.unwrap_or_else(|| json!({})), id)?;
+    lock_unpoison(&state.pending).insert(id, tx);
+    if let Err(e) = write_message(&state, &cmd, payload.unwrap_or_else(|| json!({})), id) {
+        lock_unpoison(&state.pending).remove(&id);
+        return Err(e);
+    }
     match tokio::time::timeout(Duration::from_secs(35), rx).await {
         Ok(Ok(Ok(value))) => Ok(value),
         Ok(Ok(Err(message))) => Err(message),
         Ok(Err(_)) => Err("核心进程已退出".into()),
         Err(_) => {
-            state.pending.lock().unwrap().remove(&id);
+            lock_unpoison(&state.pending).remove(&id);
             Err("操作超时".into())
         }
     }
@@ -225,8 +318,9 @@ fn trace(what: &str) {
 fn intro_near(app: AppHandle) {
     trace("intro_near");
     let Some(w) = app.get_webview_window("main") else { return };
-    let (x, y) = panel_origin(&app);
-    let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+    if let Some((px, py)) = panel_origin_physical(&app) {
+        let _ = w.set_position(PhysicalPosition::new(px, py));
+    }
     let _ = w.show();
     trace("panel pre-shown");
 }
@@ -234,10 +328,12 @@ fn intro_near(app: AppHandle) {
 /// 启动动画落地：面板光球接替动画光球，板从光球处绽开；稍后关闭动画窗口
 #[tauri::command]
 fn intro_done(app: AppHandle) {
-    trace("intro_done");
     if let Some(ui) = app.try_state::<UiState>() {
-        ui.intro_running.store(false, Ordering::Relaxed);
+        if !ui.intro_running.swap(false, Ordering::AcqRel) {
+            return;
+        }
     }
+    trace("intro_done");
     show_panel_with(&app, "land");
     let handle = app.clone();
     std::thread::spawn(move || {
@@ -278,55 +374,68 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
-fn data_dir() -> PathBuf {
+fn data_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HOMEPODSENDER_DATA") {
-        return PathBuf::from(p);
+        let pb = PathBuf::from(p);
+        if pb.is_absolute() {
+            return Some(pb);
+        }
     }
-    PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("HomePodSender")
+    let appdata = std::env::var("APPDATA").ok()?;
+    if appdata.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(appdata).join("HomePodSender"))
 }
 
 fn open_log_dir() {
-    let dir = data_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = Command::new("explorer").arg(dir).spawn();
+    let Some(dir) = data_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() || !dir.is_dir() {
+        return;
+    }
+    let explorer = std::env::var("SystemRoot")
+        .map(|r| PathBuf::from(r).join("explorer.exe"))
+        .unwrap_or_else(|_| PathBuf::from("explorer.exe"));
+    let _ = Command::new(explorer).arg(&dir).spawn();
 }
 
 // ======================= 面板显示 / 收起 =======================
 
-/// 主显示器工作区（去掉任务栏）的逻辑坐标：(x, y, w, h, 缩放)
-fn work_area(app: &AppHandle) -> Option<(f64, f64, f64, f64, f64)> {
+/// 主显示器工作区（去掉任务栏）的物理坐标与缩放比：(x, y, w, h, scale)
+fn work_area_physical(app: &AppHandle) -> Option<(i32, i32, i32, i32, f64)> {
     let m = app.primary_monitor().ok().flatten()?;
     let s = m.scale_factor();
     let wa = m.work_area();
-    Some((
-        wa.position.x as f64 / s,
-        wa.position.y as f64 / s,
-        wa.size.width as f64 / s,
-        wa.size.height as f64 / s,
-        s,
-    ))
+    Some((wa.position.x, wa.position.y, wa.size.width as i32, wa.size.height as i32, s))
 }
 
-/// 面板窗口左上角：贴住工作区右下角（窗口自带 22px 透明边距，看起来离任务栏与屏幕边缘各 22px）
-fn panel_origin(app: &AppHandle) -> (f64, f64) {
-    match work_area(app) {
-        Some((x, y, w, h, _)) => (x + w - WIN_W, y + h - WIN_H),
-        None => (200.0, 200.0),
-    }
+/// 面板窗口左上角（物理像素）：贴住工作区右下角，避免多屏混合 DPI 下的逻辑坐标偏差
+fn panel_origin_physical(app: &AppHandle) -> Option<(i32, i32)> {
+    let (x, y, w, h, s) = work_area_physical(app)?;
+    let pw = (WIN_W * s).round() as i32;
+    let ph = (WIN_H * s).round() as i32;
+    Some((x + w - pw, y + h - ph))
 }
 
 fn show_panel(app: &AppHandle) {
+    if let Some(ui) = app.try_state::<UiState>() {
+        if ui.intro_running.load(Ordering::Acquire) {
+            return;
+        }
+    }
     show_panel_with(app, "show");
 }
 
 /// 显示面板并通知前端展开：“show” = 托盘/唤出（光球弹出后绽开），“land” = 启动动画落地（光球直接接替）
 fn show_panel_with(app: &AppHandle, how: &str) {
     let Some(w) = app.get_webview_window("main") else { return };
-    let (x, y) = panel_origin(app);
-    let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+    if let Some((px, py)) = panel_origin_physical(app) {
+        let _ = w.set_position(PhysicalPosition::new(px, py));
+    }
     let _ = w.show();
     let _ = w.set_focus();
     if let Some(ui) = app.try_state::<UiState>() {
+        ui.hide_gen.fetch_add(1, Ordering::Relaxed);
         ui.visible.store(true, Ordering::Relaxed);
         ui.hiding.store(false, Ordering::Relaxed);
     }
@@ -339,14 +448,15 @@ fn request_hide(app: &AppHandle) {
     if !ui.visible.load(Ordering::Relaxed) || ui.hiding.swap(true, Ordering::Relaxed) {
         return;
     }
-    *ui.last_hide.lock().unwrap() = Instant::now();
+    let hide_gen = ui.hide_gen.fetch_add(1, Ordering::Relaxed) + 1;
+    *lock_unpoison(&ui.last_hide) = Some(Instant::now());
     let _ = app.emit_to("main", "panel", "hide");
-    // 兜底：前端若没有回应，700ms 后直接隐藏
+    // 兜底：前端若没有回应，700ms 后直接隐藏（校验 hide_gen 防止误隐后续重新打开的面板）
     let handle = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(700));
         if let Some(ui) = handle.try_state::<UiState>() {
-            if ui.hiding.load(Ordering::Relaxed) {
+            if ui.hiding.load(Ordering::Relaxed) && ui.hide_gen.load(Ordering::Relaxed) == hide_gen {
                 panel_hidden(handle.clone());
             }
         }
@@ -355,7 +465,7 @@ fn request_hide(app: &AppHandle) {
 
 fn toggle_panel(app: &AppHandle) {
     let Some(ui) = app.try_state::<UiState>() else { return };
-    if ui.intro_running.load(Ordering::Relaxed) {
+    if ui.intro_running.load(Ordering::Acquire) {
         return;
     }
     if ui.visible.load(Ordering::Relaxed) && !ui.hiding.load(Ordering::Relaxed) {
@@ -363,8 +473,10 @@ fn toggle_panel(app: &AppHandle) {
         return;
     }
     // 刚因失焦收起（点击托盘图标本身就会让面板失焦），这次点击视为“关闭”
-    if ui.last_hide.lock().unwrap().elapsed() < Duration::from_millis(400) {
-        return;
+    if let Some(t) = *lock_unpoison(&ui.last_hide) {
+        if t.elapsed() < Duration::from_millis(400) {
+            return;
+        }
     }
     show_panel(app);
 }
@@ -385,23 +497,32 @@ fn tray_status(language: &str, status: &str) -> String {
             .replace("系统", "系統")
             .replace("网络", "網路")
             .replace("设备", "裝置")
-            .replace("无响应", "無回應");
+            .replace("无响应", "無回應")
+            .replace("核心进程已退出", "核心程序已結束");
     }
     let text = status.trim();
     if text == "未连接" { return "Not connected".into(); }
     if text == "已连接，正在播放系统声音" { return "Connected, playing system audio".into(); }
-    if text.starts_with("已连接") { return text.replace("已连接", "Connected").replace("台", " devices").replace("，正在播放系统声音", ", playing system audio"); }
+    if text.starts_with("已连接 ") && text.contains(" 台") {
+        let mid = text.trim_start_matches("已连接 ");
+        if let Some(idx) = mid.find(" 台") {
+            let count = mid[..idx].trim();
+            return format!("Connected {count} devices, playing system audio");
+        }
+    }
     if text.starts_with("正在连接") { return "Connecting…".into(); }
-    if text.starts_with("重新连接") || text.starts_with("重连") { return "Reconnecting…".into(); }
+    if text.starts_with("重新连接") || text.starts_with("重连") || text.starts_with("连接中断") { return "Reconnecting…".into(); }
     if text.starts_with("连接失败") { return "Connection failed".into(); }
-    if text.starts_with("连接已断开") { return "Connection closed".into(); }
+    if text.starts_with("连接已断开") || text == "已断开" { return "Disconnected".into(); }
+    if text == "核心进程已退出" { return "Core process exited".into(); }
     if text.is_empty() { "HomePod Sender".into() } else { text.to_string() }
 }
 
 fn tray_tooltip(language: &str, status: &str) -> String {
     let prefix = if tray_language(language) == "zh-TW" { "HomePod 推流" } else { "HomePod Sender" };
     let status = tray_status(language, status);
-    if status.is_empty() { prefix.to_string() } else { format!("{prefix} — {status}") }
+    let full = if status.is_empty() { prefix.to_string() } else { format!("{prefix} — {status}") };
+    full.chars().take(100).collect()
 }
 
 fn apply_tray_language(items: &TrayItems, language: &str) {
@@ -417,14 +538,16 @@ fn apply_tray_language(items: &TrayItems, language: &str) {
 fn set_tray_language(app: AppHandle, language: String) {
     let language = tray_language(&language).to_string();
     let status = if let Some(ui) = app.try_state::<UiState>() {
-        *ui.language.lock().unwrap() = language.clone();
-        ui.last_status.lock().unwrap().clone()
+        let mut tt = lock_unpoison(&ui.tray_text);
+        tt.language = language.clone();
+        tt.last_status.clone()
     } else {
         String::new()
     };
     if let Some(items) = app.try_state::<TrayItems>() {
         apply_tray_language(&items, &language);
-        let _ = items.tray.set_tooltip(Some(&tray_tooltip(&language, &status)));
+        let tip = tray_tooltip(&language, &status);
+        let _ = items.tray.set_tooltip(Some(&tip));
     }
 }
 
@@ -435,16 +558,20 @@ fn update_tray_state(app: &AppHandle, state: &str, status: &str) {
             "Connecting" | "Reconnecting" => 1,
             _ => 0,
         };
-        ui.stream.store(v, Ordering::Relaxed);
-        *ui.last_status.lock().unwrap() = status.to_string();
-        ui.language.lock().unwrap().clone()
+        let prev = ui.stream.swap(v, Ordering::Relaxed);
+        if prev != v {
+            ui.wake_animator();
+        }
+        let mut tt = lock_unpoison(&ui.tray_text);
+        tt.last_status = status.to_string();
+        tt.language.clone()
     } else {
         "zh-TW".to_string()
     };
     if let Some(items) = app.try_state::<TrayItems>() {
         let _ = items.connect.set_enabled(state == "Disconnected");
-        let _ = items.disconnect.set_enabled(state == "Streaming" || state == "Reconnecting");
-        let tip: String = tray_tooltip(&language, status).chars().take(100).collect();
+        let _ = items.disconnect.set_enabled(state != "Disconnected");
+        let tip = tray_tooltip(&language, status);
         let _ = items.tray.set_tooltip(Some(&tip));
     }
 }
@@ -454,14 +581,19 @@ fn orb_icon(color: f32, energy: f32, time: f32) -> tauri::image::Image<'static> 
     tauri::image::Image::new_owned(rgba, TRAY_PX, TRAY_PX)
 }
 
-/// 托盘图标动画：未播放 = 静态透明白球；连接中 = 半彩色缓动；播放中 = 随电平滚动的彩色光球
+/// 托盘图标动画：未播放 = 静态透明白球并挂起休眠；连接中 = 半彩色缓动；播放中 = 随电平滚动的彩色光球
 fn spawn_tray_animator(app: AppHandle) {
     std::thread::spawn(move || {
         let mut last_idle = false;
         let mut energy = 0.0f32;
         loop {
-            std::thread::sleep(Duration::from_millis(80));
-            let (Some(ui), Some(items)) = (app.try_state::<UiState>(), app.try_state::<TrayItems>()) else { continue };
+            let (Some(ui), Some(items)) = (app.try_state::<UiState>(), app.try_state::<TrayItems>()) else {
+                std::thread::sleep(Duration::from_millis(80));
+                continue;
+            };
+            if ui.exiting.load(Ordering::Acquire) {
+                break;
+            }
             let stream = ui.stream.load(Ordering::Relaxed);
             if stream == 0 {
                 if !last_idle {
@@ -469,6 +601,13 @@ fn spawn_tray_animator(app: AppHandle) {
                     last_idle = true;
                 }
                 energy = 0.0;
+                // 空闲时在 Condvar 上挂起，不占 CPU 唤醒
+                let (lock, cvar) = &*ui.anim_wake;
+                let mut wake = lock_unpoison(lock);
+                while !*wake && ui.stream.load(Ordering::Relaxed) == 0 && !ui.exiting.load(Ordering::Acquire) {
+                    wake = cvar.wait(wake).unwrap_or_else(|e| e.into_inner());
+                }
+                *wake = false;
                 continue;
             }
             last_idle = false;
@@ -482,6 +621,7 @@ fn spawn_tray_animator(app: AppHandle) {
             energy += (target - energy) * if target > energy { 0.5 } else { 0.15 };
             let color = if stream == 2 { 1.0 } else { 0.55 };
             let _ = items.tray.set_icon(Some(orb_icon(color, energy, orb::clock())));
+            std::thread::sleep(Duration::from_millis(80));
         }
     });
 }
@@ -531,12 +671,14 @@ fn with_data_dir<'a, R: tauri::Runtime, M: Manager<R>>(
     }
 }
 
-// ======================= 截图 / 预览参数 =======================
+// ======================= 截图 / 预览参数（仅调试构建） =======================
 
+#[cfg(debug_assertions)]
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
+#[cfg(debug_assertions)]
 fn preview_config(args: &[String]) -> Option<Value> {
     if !args.iter().any(|a| a == "--screenshot") {
         return None;
@@ -556,33 +698,40 @@ fn preview_config(args: &[String]) -> Option<Value> {
     }))
 }
 
+#[cfg(not(debug_assertions))]
+fn preview_config(_args: &[String]) -> Option<Value> {
+    None
+}
+
 // ======================= 入口 =======================
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // 调试：导出托盘图标帧 / 应用图标帧
-    if let Some(dir) = arg_value(&args, "--dump-tray") {
-        if let Err(e) = orb::dump(std::path::Path::new(&dir)) {
-            eprintln!("dump-tray 失败: {e}");
+    #[cfg(debug_assertions)]
+    {
+        if let Some(dir) = arg_value(&args, "--dump-tray") {
+            if let Err(e) = orb::dump(std::path::Path::new(&dir)) {
+                eprintln!("dump-tray 失败: {e}");
+            }
+            return;
         }
-        return;
-    }
-    if let Some(dir) = arg_value(&args, "--dump-app-icons") {
-        if let Err(e) = orb::dump_app_icons(std::path::Path::new(&dir)) {
-            eprintln!("dump-app-icons 失败: {e}");
+        if let Some(dir) = arg_value(&args, "--dump-app-icons") {
+            if let Err(e) = orb::dump_app_icons(std::path::Path::new(&dir)) {
+                eprintln!("dump-app-icons 失败: {e}");
+            }
+            return;
         }
-        return;
     }
 
     let start_hidden = args.iter().any(|a| a == "--tray");
     let preview = preview_config(&args);
-    // 自动化测试用：面板失焦时不自动收起（避免测试期间点了别的窗口导致面板消失）
-    let keep_panel = std::env::var_os("HPS_KEEP_PANEL").is_some();
-    // 截图模式与自动化测试（HPS_ISOLATED）要和已安装、正在运行的程序完全隔离：
-    // 不注册单实例（否则会被当成“再次启动”转交给它后直接退出），WebView2 也用单独的数据目录
-    let isolated = preview.is_some() || std::env::var_os("HPS_ISOLATED").is_some();
-    let webview_dir = isolated.then(|| std::env::temp_dir().join("HomePodSender-isolated-webview"));
+    let keep_panel = cfg!(debug_assertions) && std::env::var_os("HPS_KEEP_PANEL").is_some();
+    let isolated = cfg!(debug_assertions) && (preview.is_some() || std::env::var_os("HPS_ISOLATED").is_some());
+    let webview_dir = isolated.then(|| {
+        std::env::temp_dir().join(format!("HomePodSender-isolated-webview-{}", std::process::id()))
+    });
 
     let mut builder = tauri::Builder::default();
     if !isolated {
@@ -630,17 +779,13 @@ fn main() {
                 return Ok(());
             }
 
-            // ---------- 正常运行 ----------
-            let state = start_sidecar(&handle);
-            app.manage(state);
+            // ---------- 正常运行：先建托盘与主窗口，再拉起 sidecar 避免丢失早期事件 ----------
             create_tray(app)?;
             spawn_tray_animator(handle.clone());
 
-            let (px, py) = panel_origin(&handle);
             let main = with_data_dir(WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into())), &webview_dir)
                 .title("HomePod 推流")
                 .inner_size(WIN_W, WIN_H)
-                .position(px, py)
                 .resizable(false)
                 .maximizable(false)
                 .minimizable(false)
@@ -653,20 +798,31 @@ fn main() {
                 .initialization_script("window.__HPS_VIEW__ = 'panel';")
                 .visible(false)
                 .build()?;
-            let _ = main;
+            if let Some((px, py)) = panel_origin_physical(&handle) {
+                let _ = main.set_position(PhysicalPosition::new(px, py));
+            }
+
+            let state = start_sidecar(&handle);
+            app.manage(state);
 
             if !start_hidden {
                 // 启动动画：覆盖整个主显示器的透明、鼠标穿透窗口
-                let (mx, my, mw, mh) = match handle.primary_monitor().ok().flatten() {
-                    Some(m) => {
-                        let s = m.scale_factor();
-                        (m.position().x as f64 / s, m.position().y as f64 / s, m.size().width as f64 / s, m.size().height as f64 / s)
-                    }
-                    None => (0.0, 0.0, 1280.0, 720.0),
+                let (mx_p, my_p, mw_p, mh_p, scale) = match handle.primary_monitor().ok().flatten() {
+                    Some(m) => (
+                        m.position().x,
+                        m.position().y,
+                        m.size().width as i32,
+                        m.size().height as i32,
+                        m.scale_factor(),
+                    ),
+                    None => (0, 0, 1280, 720, 1.0),
                 };
+                let (px_p, py_p) = panel_origin_physical(&handle).unwrap_or((200, 200));
+                let tx = (px_p - mx_p) as f64 / scale + ORB_X;
+                let ty = (py_p - my_p) as f64 / scale + ORB_Y;
                 let cfg = json!({
-                    "tx": px + ORB_X - mx,
-                    "ty": py + ORB_Y - my,
+                    "tx": tx,
+                    "ty": ty,
                     "size": ORB_SIZE,
                     "endColor": 0.0,
                     "endEnergy": 0.0,
@@ -674,8 +830,7 @@ fn main() {
                 let script = format!("window.__HPS_VIEW__ = 'intro'; window.__HPS_INTRO__ = {};", cfg);
                 let intro = with_data_dir(WebviewWindowBuilder::new(app, "intro", WebviewUrl::App("index.html".into())), &webview_dir)
                     .title("HomePod 推流")
-                    .inner_size(mw, mh)
-                    .position(mx, my)
+                    .inner_size(mw_p as f64 / scale, mh_p as f64 / scale)
                     .resizable(false)
                     .decorations(false)
                     .transparent(true)
@@ -686,10 +841,11 @@ fn main() {
                     .initialization_script(&script)
                     .visible(false)
                     .build()?;
+                let _ = intro.set_position(PhysicalPosition::new(mx_p, my_p));
                 let _ = intro.set_ignore_cursor_events(true);
                 intro.show()?;
                 if let Some(ui) = app.try_state::<UiState>() {
-                    ui.intro_running.store(true, Ordering::Relaxed);
+                    ui.intro_running.store(true, Ordering::Release);
                 }
                 // 兜底：动画异常时 6 秒后仍然交接
                 let h2 = handle.clone();
@@ -719,12 +875,29 @@ fn main() {
         .expect("error while building HomePodSender")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(ui) = app.try_state::<UiState>() {
+                    ui.exiting.store(true, Ordering::Release);
+                    ui.wake_animator();
+                }
                 write_fire(app, "quit", json!({}));
-                std::thread::sleep(Duration::from_millis(200));
                 if let Some(state) = app.try_state::<SidecarState>() {
-                    if let Some(mut child) = state.child.lock().unwrap().take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                    // 关闭写入通道以向 sidecar 发送 EOF，并给它充足时间落盘与拆除会话
+                    lock_unpoison(&state.tx).take();
+                    if let Some(mut child) = lock_unpoison(&state.child).take() {
+                        let deadline = Instant::now() + Duration::from_millis(1500);
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(_)) => break,
+                                Ok(None) if Instant::now() < deadline => {
+                                    std::thread::sleep(Duration::from_millis(30));
+                                }
+                                _ => {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }

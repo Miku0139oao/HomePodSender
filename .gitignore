@@ -54,5 +54,4 @@ config.local.json
 # ---- 设计参考衍生图（由 --dump-tray / 裁切脚本生成，可重建）----
 design-ref/*.png
 design-ref/*.webp
-design-ref/app-icons/
 design-ref/tray/

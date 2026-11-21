@@ -77,29 +77,25 @@ const ips = (r) => r?.payload?.config?.ips;
 const show = (v) => JSON.stringify(v);
 const same = (v, want) => Array.isArray(v) && v.length === want.length && want.every((x) => v.includes(x));
 
-// 场景 1：两台都自称组长（未成对），也就是本机 HomePod 当前的实际状态
+// 场景 1：两台都自称组长（未成对）——两台一起推，切到独立设备后只推该设备
 {
   const sc = start([
     { Name: 'A', Ip: A, Role: '组长', PairId: PAIR, Unpaired: true },
     { Name: 'B', Ip: B, Role: '组长', PairId: PAIR, Unpaired: true },
+    { Name: 'C', Ip: NON_PAIR, Role: '', PairId: '', Unpaired: false },
   ]);
   try {
     const ready = await sc.next((m) => m.ev === 'ready');
     ok('未成对的一对：默认两台一起（每只各开一路）', same(ready.config.ips, [A, B]), show(ready.config.ips));
 
-    let r = await sc.call('toggleDevice', { ip: B });
-    ok('点已勾选的一台：取消它，只剩另一台', r.ok && same(ips(r), [A]), `ok=${r.ok} ips=${show(ips(r))}`);
-    r = await sc.call('toggleDevice', { ip: A });
-    ok('最后一台不会被取消（保留它自己）', r.ok && same(ips(r), [A]), show(ips(r)));
-    r = await sc.call('toggleDevice', { ip: B });
-    ok('点同对的另一台：恢复成两台一起', r.ok && same(ips(r), [A, B]), show(ips(r)));
-    r = await sc.call('toggleDevice', { ip: A });
-    ok('两台一起时取消其中一台（这次取消 A）', r.ok && same(ips(r), [B]), show(ips(r)));
+    let r = await sc.call('selectDevice', { ip: B });
+    ok('未成对的一对中选另一台：仍保持两台一起', r.ok && same(ips(r), [A, B]), `ok=${r.ok} ips=${show(ips(r))}`);
 
-    r = await sc.call('toggleDevice', { ip: NON_PAIR });
+    r = await sc.call('selectDevice', { ip: NON_PAIR });
     ok('点别的设备：整体切过去，只勾它', r.ok && same(ips(r), [NON_PAIR]), show(ips(r)));
+
     r = await sc.call('selectDevice', { ip: A });
-    ok('selectDevice（手工加 IP）只选它自己', r.ok && same(ips(r), [A]), show(ips(r)));
+    ok('切回未成对的一对：恢复两台一起', r.ok && same(ips(r), [A, B]), show(ips(r)));
     ok('全程没有发起连接', !sc.events.some((m) => m.ev === 'state' && m.state !== 'Disconnected'));
   } catch (e) {
     ok('场景 1 执行', false, e.message);
@@ -116,10 +112,10 @@ const same = (v, want) => Array.isArray(v) && v.length === want.length && want.e
   ]);
   try {
     await sc.next((m) => m.ev === 'ready');
-    let r = await sc.call('toggleDevice', { ip: B });
+    let r = await sc.call('selectDevice', { ip: B });
     ok('成对时点成员：仍只连组长', r.ok && same(ips(r), [A]), show(ips(r)));
-    r = await sc.call('toggleDevice', { ip: A });
-    ok('成对时最后一台保留', r.ok && same(ips(r), [A]), show(ips(r)));
+    r = await sc.call('selectDevice', { ip: A });
+    ok('成对时点组长：保持组长', r.ok && same(ips(r), [A]), show(ips(r)));
     ok('全程没有发起连接', !sc.events.some((m) => m.ev === 'state' && m.state !== 'Disconnected'));
   } catch (e) {
     ok('场景 2 执行', false, e.message);

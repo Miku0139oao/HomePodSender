@@ -230,11 +230,11 @@ static void SelfTest()
 
     // 立体声对裁决：配成对时给出组长 / 成员；没有配成对（例如两台都自称组长）时保留各自的报告并标为未成对
     {
-        const string T = "60854346-1693-5801-9B42-0D42507F17F5";
+        const string T = "00000000-0000-4000-8000-000000000001";
         Ap2Core.FoundDevice Dev(string ip, bool igl, bool pgid, string pair = T) =>
             new(ip, ip, "AudioAccessory5,1", "", igl && !pgid ? "组长" : "成员", pair) { ClaimsLeader = igl, HasParentGroup = pgid };
         Ap2Core.FoundDevice At(IEnumerable<Ap2Core.FoundDevice> r, string ip) => r.First(f => f.Ip == ip);
-        var a = "192.168.50.71"; var b = "192.168.50.23";
+        var a = "192.0.2.10"; var b = "192.0.2.11";
 
         var ok1 = Ap2Core.Discovery.ResolvePairs(new[] { Dev(a, true, false), Dev(b, false, true) });
         Check(At(ok1, a).Role == "组长" && At(ok1, b).Role == "成员" && !At(ok1, a).Unpaired && !At(ok1, b).Unpaired, "正常的一对：组长 / 成员");
@@ -248,15 +248,15 @@ static void SelfTest()
         Check(At(none, a).Unpaired && At(none, b).Unpaired && At(none, a).Role == "成员", "都不自称组长：未成对，角色保持各自的报告");
         var solo = Ap2Core.Discovery.ResolvePairs(new[] { Dev(a, true, false) });
         Check(At(solo, a).Role == "组长" && !At(solo, a).Unpaired, "只探测到一台：保持它自己的判断");
-        var other = Ap2Core.Discovery.ResolvePairs(new[] { Dev("192.168.50.9", true, false, "") });
+        var other = Ap2Core.Discovery.ResolvePairs(new[] { Dev("192.0.2.9", true, false, "") });
         Check(other.Single().Role == "组长" && !other.Single().Unpaired, "非立体声对设备不受影响");
         Ok("立体声对裁决：成对给出组长 / 成员；两台都自称组长时如实显示并标为未成对");
     }
 
-    // 连接目标：成对时选成员改连组长；两台都自称组长时沿用上次确认的组长，绝不直连成员
+    // 连接目标：成对时选成员改连组长；两台都自称组长时按所选设备连接
     {
-        const string T = "60854346-1693-5801-9B42-0D42507F17F5";
-        var a = "192.168.50.71"; var b = "192.168.50.23";
+        const string T = "00000000-0000-4000-8000-000000000001";
+        var a = "192.0.2.10"; var b = "192.0.2.11";
         List<DeviceEntry> Devices(string roleA, bool unpairedA, string roleB, bool unpairedB) => new()
         {
             new DeviceEntry { Ip = a, PairId = T, Role = roleA, Unpaired = unpairedA },
@@ -286,8 +286,8 @@ static void SelfTest()
 
     // 推流目标：成对只连组长；两台都未成对时两路一起推
     {
-        const string T = "60854346-1693-5801-9B42-0D42507F17F5";
-        var a = "192.168.50.71"; var b = "192.168.50.23";
+        const string T = "00000000-0000-4000-8000-000000000001";
+        var a = "192.0.2.10"; var b = "192.0.2.11";
         var paired = new List<DeviceEntry>
         {
             new() { Ip = a, PairId = T, Role = "组长" },
@@ -324,7 +324,7 @@ static void SelfTest()
         Ok("两路推流共用采样，不会把缓冲拆开");
     }
 
-    // 画面对齐：扩展包能被验签，本地端口能回答延迟，策略只写测试键
+    // 画面对齐：扩展包能被验签（含 CRX3 前缀），本地端口校验 Host 并回答延迟，策略只写测试键
     {
         using var key = System.Security.Cryptography.RSA.Create(2048);
         byte[] crx = LipSyncPack.BuildCrx(key);
@@ -340,6 +340,7 @@ static void SelfTest()
             LipSyncPack.ExportUnpacked(key, unpacked);
             string manifest = File.ReadAllText(Path.Combine(unpacked, "manifest.json"));
             Check(manifest.Contains(LipSyncPack.PublicKeyBase64(key)), "解压目录的清单应带同一把公钥");
+            Check(!manifest.Contains("\"MAIN\""), "扩展清单不应注入 MAIN 世界");
             Check(File.ReadAllText(Path.Combine(unpacked, "sw.js")).Contains("hps-lip-ask"), "解压目录应有后台脚本");
         }
         finally
@@ -355,32 +356,42 @@ static void SelfTest()
         Check(xml.Contains(id) && xml.Contains("/lipsync.crx"), "更新清单应带扩展 ID");
         byte[] got = http.GetByteArrayAsync("http://127.0.0.1:" + server.Port + "/lipsync.crx").GetAwaiter().GetResult();
         Check(got.AsSpan().SequenceEqual(crx), "下载的扩展包应与签名的那份一致");
-        const string testKey = @"Software\HomePodSender\LipSyncTest";
-        try
+        // 验证拒绝非法 Host 标头（防 DNS Rebinding）
+        using (var badReq = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get, "http://127.0.0.1:" + server.Port + "/lipsync"))
         {
-            using var hive = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(testKey)!;
-            using (var preset = hive.CreateSubKey("ExtensionInstallForcelist"))
-                preset?.SetValue("1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;https://example.invalid/update.xml");
-            LipSyncPolicy.Install(hive, id, server.Port);
-            using (var list = hive.OpenSubKey("ExtensionInstallForcelist"))
-            {
-                Check(list?.GetValue("1") as string == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;https://example.invalid/update.xml", "已有的列表项应留在 1");
-                Check(list?.GetValue("2") as string == LipSyncPolicy.ForceListValue(id, server.Port), "自己的强制安装应写在下一个数字");
-                Check(list?.GetValue("hps") == null, "浏览器不认名为 hps 的列表项");
-            }
-            LipSyncPolicy.Remove(hive, id, server.Port);
-            using (var list = hive.OpenSubKey("ExtensionInstallForcelist"))
-                Check(list?.GetValue("1") as string == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;https://example.invalid/update.xml" && list?.GetValue("2") == null, "只删自己的列表项");
-            using (var preset = hive.OpenSubKey("ExtensionInstallForcelist", writable: true))
-                preset?.DeleteValue("1");
-            LipSyncPolicy.Install(hive, id, server.Port);
-            LipSyncPolicy.Remove(hive, id, server.Port);
-            using var left = hive.OpenSubKey("ExtensionInstallForcelist");
-            Check(left == null, "没有其他项时子键应消失");
+            badReq.Headers.Host = "evil.example";
+            var badRes = http.Send(badReq);
+            Check((int)badRes.StatusCode == 403, "非法 Host 应返回 403，实际 " + (int)badRes.StatusCode);
         }
-        finally
+        if (OperatingSystem.IsWindows())
         {
-            Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testKey, throwOnMissingSubKey: false);
+            const string testKey = @"Software\HomePodSender\LipSyncTest";
+            try
+            {
+                using var hive = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(testKey)!;
+                using (var preset = hive.CreateSubKey("ExtensionInstallForcelist"))
+                    preset?.SetValue("1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;https://example.invalid/update.xml");
+                LipSyncPolicy.Install(hive, id, server.Port);
+                using (var list = hive.OpenSubKey("ExtensionInstallForcelist"))
+                {
+                    Check(list?.GetValue("1") as string == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;https://example.invalid/update.xml", "已有的列表项应留在 1");
+                    Check(list?.GetValue("2") as string == LipSyncPolicy.ForceListValue(id, server.Port), "自己的强制安装应写在下一个数字");
+                    Check(list?.GetValue("hps") == null, "浏览器不认名为 hps 的列表项");
+                }
+                LipSyncPolicy.Remove(hive, id, server.Port);
+                using (var list = hive.OpenSubKey("ExtensionInstallForcelist"))
+                    Check(list?.GetValue("1") as string == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;https://example.invalid/update.xml" && list?.GetValue("2") == null, "只删自己的列表项");
+                using (var preset = hive.OpenSubKey("ExtensionInstallForcelist", writable: true))
+                    preset?.DeleteValue("1");
+                LipSyncPolicy.Install(hive, id, server.Port);
+                LipSyncPolicy.Remove(hive, id, server.Port);
+                using var left = hive.OpenSubKey("ExtensionInstallForcelist");
+                Check(left == null, "没有其他项时子键应消失");
+            }
+            finally
+            {
+                Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testKey, throwOnMissingSubKey: false);
+            }
         }
         Ok("画面对齐：扩展包、本地端口、策略写入");
     }
@@ -391,17 +402,23 @@ static void SelfTest()
 static async Task<int> Run(string[] args)
 {
     string Arg(string name, string def) { int i = Array.IndexOf(args, "--" + name); return i < 0 ? def : (i + 1 < args.Length && !args[i + 1].StartsWith("--") ? args[i + 1] : "true"); }
+    string ip = Arg("ip", "");
+    if (string.IsNullOrWhiteSpace(ip))
+    {
+        Console.WriteLine("请通过 --ip <HomePod IP> 指定目标地址");
+        return 1;
+    }
     var o = new Ap2Options
     {
-        Ip = Arg("ip", "192.168.50.71"),
+        Ip = ip,
         Dict = Arg("dict", "rich"),
         Record = Arg("record", "before"),
         AdvertiseDataPort = Arg("dataport", "false") == "true",
         Verbose = Arg("verbose", "false") == "true",
     };
-    double seconds = double.Parse(Arg("seconds", "6"));
+    double seconds = double.Parse(Arg("seconds", "6"), System.Globalization.CultureInfo.InvariantCulture);
     bool sound = Arg("sound", "false") == "true";   // 安全默认：不加 --sound 一律推静音
-    double freq = double.Parse(Arg("freq", "440"));
+    double freq = double.Parse(Arg("freq", "440"), System.Globalization.CultureInfo.InvariantCulture);
     string vol = Arg("volume", "");
 
     using var s = new Ap2Session(o);
@@ -409,7 +426,7 @@ static async Task<int> Run(string[] args)
     try
     {
         await s.ConnectAsync();
-        if (vol != "") await s.SetVolumeDbAsync(double.Parse(vol));
+        if (vol != "") await s.SetVolumeDbAsync(double.Parse(vol, System.Globalization.CultureInfo.InvariantCulture));
         s.StartStreaming(sound ? new ToneSource(freq) : new SilenceSource());
         Console.WriteLine("推流 " + seconds + " 秒（" + (sound ? "测试音" : "静音") + "）");
         await Task.Delay(TimeSpan.FromSeconds(seconds));
@@ -456,28 +473,31 @@ static void ResampleTest()
     {
         var (g, snr) = Measure(f, f);
         Console.WriteLine($"48k→44.1k  {f,6:0} Hz: 增益 {g,7:0.000} dB  信噪比 {snr,6:0.0} dB");
+        if (Math.Abs(g) > 0.5 || snr < 55) throw new Exception($"重采样通带不达标: {f}Hz gain={g:0.00}dB snr={snr:0.0}dB");
     }
     // 混叠抑制：23kHz 输入会折叠到 44100-23000=21100Hz
     {
         var (g, _) = Measure(23000, 21100);
         Console.WriteLine($"48k→44.1k  23000 Hz 输入（折叠到 21100 Hz）: 相对衰减 {g,7:0.0} dB");
+        if (g > -50) throw new Exception($"重采样混叠抑制不足: {g:0.0}dB");
     }
     // 44.1k→44.1k（设备已是 44.1kHz）与 96k→44.1k
-    { var (g, snr) = Measure(1000, 1000, 44100); Console.WriteLine($"44.1k→44.1k   1000 Hz: 增益 {g,7:0.000} dB  信噪比 {snr,6:0.0} dB"); }
-    { var (g, snr) = Measure(1000, 1000, 96000); Console.WriteLine($"96k→44.1k    1000 Hz: 增益 {g,7:0.000} dB  信噪比 {snr,6:0.0} dB"); }
-    // 速率精度：消耗 10 秒输入应产出 441000 帧（±2）
+    { var (g, snr) = Measure(1000, 1000, 44100); Console.WriteLine($"44.1k→44.1k   1000 Hz: 增益 {g,7:0.000} dB  信噪比 {snr,6:0.0} dB"); if (Math.Abs(g) > 0.5 || snr < 60) throw new Exception("44.1k 重采样不达标"); }
+    { var (g, snr) = Measure(1000, 1000, 96000); Console.WriteLine($"96k→44.1k    1000 Hz: 增益 {g,7:0.000} dB  信噪比 {snr,6:0.0} dB"); if (Math.Abs(g) > 0.5 || snr < 60) throw new Exception("96k 重采样不达标"); }
+    // 速率精度：消耗 10 秒输入应产出 441000 帧（±200）
     {
         var rs = new Ap2Core.Audio.StreamResampler(48000, 44100);
         var buf = new float[960 * 2]; var tmp = new float[352 * 2]; long outFrames = 0;
         for (int s = 0; s < 1000; s++) { rs.Push(buf, 480); for (;;) { int g = rs.Pull(tmp, 352); outFrames += g; if (g < 352) break; } }
         Console.WriteLine($"速率精度：输入 480000 帧 → 输出 {outFrames} 帧（理想 441000，缓冲内残留约 {rs.BufferedFrames} 帧）");
+        if (Math.Abs(outFrames - 441000) > 500) throw new Exception($"重采样速率偏差过大: {outFrames}");
     }
 }
 
 static void CaptureTest(string[] args)
 {
     int i = Array.IndexOf(args, "--seconds");
-    double seconds = i >= 0 ? double.Parse(args[i + 1]) : 3;
+    double seconds = i >= 0 && i + 1 < args.Length ? double.Parse(args[i + 1], System.Globalization.CultureInfo.InvariantCulture) : 3;
     using var cap = new Ap2Core.Audio.LoopbackCapture(Console.WriteLine);
     float peak = 0; long chunks = 0;
     cap.DataAvailable += (buf, frames) => { chunks++; for (int k = 0; k < frames * 2; k++) peak = Math.Max(peak, Math.Abs(buf[k])); };
@@ -492,7 +512,7 @@ static void CaptureTest(string[] args)
 static void SourceTest(string[] args)
 {
     int i = Array.IndexOf(args, "--seconds");
-    double seconds = i >= 0 ? double.Parse(args[i + 1]) : 20;
+    double seconds = i >= 0 && i + 1 < args.Length ? double.Parse(args[i + 1], System.Globalization.CultureInfo.InvariantCulture) : 20;
     using var src = new Ap2Core.Audio.LoopbackSource(Console.WriteLine);
     var pcm = new short[352 * 2];
     var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -694,8 +714,8 @@ static async Task<int> ControllerTest()
 static async Task<int> FakeRx(string[] args)
 {
     string Arg(string n, string d) { int i = Array.IndexOf(args, "--" + n); return i >= 0 && i + 1 < args.Length ? args[i + 1] : d; }
-    int port = int.Parse(Arg("port", "7000"));
-    double seconds = double.Parse(Arg("seconds", "60"));
+    int port = int.Parse(Arg("port", "7000"), System.Globalization.CultureInfo.InvariantCulture);
+    double seconds = double.Parse(Arg("seconds", "60"), System.Globalization.CultureInfo.InvariantCulture);
     using var rx = new FakeReceiver(Console.WriteLine, port) { DropEvery = 0 };
     Console.WriteLine("假 HomePod 已在 127.0.0.1:" + rx.Port + " 监听 " + seconds + " 秒");
     var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -724,7 +744,8 @@ static async Task<int> Probe(string[] args)
     foreach (var ip in ips)
     {
         var f = resolved.FirstOrDefault(x => x.Ip == ip);
-        Console.WriteLine(f == null ? ip + ": 无响应或不是 AirPlay 设备" : $"{ip}: 名称={f.Name} 型号={f.Model} 角色={(f.Role == "" ? "（单独设备）" : f.Role)}{(f.Unpaired ? "（未成对）" : "")} 立体声对ID={(f.PairId == "" ? "-" : f.PairId[..8] + "…")}");
+        string pairShort = f == null || f.PairId == "" ? "-" : (f.PairId.Length > 8 ? f.PairId[..8] + "…" : f.PairId);
+        Console.WriteLine(f == null ? ip + ": 无响应或不是 AirPlay 设备" : $"{ip}: 名称={f.Name} 型号={f.Model} 角色={(f.Role == "" ? "（单独设备）" : f.Role)}{(f.Unpaired ? "（未成对）" : "")} 立体声对ID={pairShort}");
         if (!txt || f == null) continue;
         if (await Ap2Core.Discovery.FetchInfoAsync(ip) is not { } info) continue;
         var t = Ap2Core.Discovery.TxtOf(info);

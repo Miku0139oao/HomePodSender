@@ -12,6 +12,7 @@ public sealed class SystemAudioSource : IAudioSource, IDisposable
     readonly Timer _watch;
     LoopbackSource? _cur;
     volatile bool _disposed;
+    int _checking;
     int _failures;
 
     public SystemAudioSource(Action<string> log, string? deviceId = null)
@@ -25,22 +26,34 @@ public sealed class SystemAudioSource : IAudioSource, IDisposable
 
     public string DeviceId { get { lock (_lock) return _cur?.DeviceId ?? ""; } }
     public float TakePeak() { LoopbackSource? c; lock (_lock) c = _cur; return c?.TakePeak() ?? 0f; }
-    public long Underruns { get { lock (_lock) return _cur?.Underruns ?? 0; } }
+    public long Underruns { get { LoopbackSource? c; lock (_lock) c = _cur; return c?.Underruns ?? 0; } }
 
     void Open()
     {
+        if (_disposed) return;
         try
         {
-            var s = new LoopbackSource(_log, _deviceId);
-            s.CaptureStopped += why => OnStopped(s, why);
-            lock (_lock) _cur = s;
-            _failures = 0;
+            var s = new LoopbackSource(_log, _deviceId, OnStopped);
+            LoopbackSource? old = null;
+            bool disposeNew = false;
+            lock (_lock)
+            {
+                if (_disposed) disposeNew = true;
+                else { old = _cur; _cur = s; _failures = 0; }
+            }
+            if (disposeNew)
+            {
+                try { s.Dispose(); } catch { }
+                return;
+            }
+            if (old != null) { try { old.Dispose(); } catch { } }
             _log("系统声音抓取已就绪: " + s.Format);
         }
         catch (Exception e)
         {
-            lock (_lock) _cur = null;
-            if (_failures++ < 3) _log("打开系统声音抓取失败: " + e.Message);
+            int failCount;
+            lock (_lock) { failCount = _failures++; }
+            if (failCount < 3) _log("打开系统声音抓取失败: " + e.Message);
         }
     }
 
@@ -55,8 +68,10 @@ public sealed class SystemAudioSource : IAudioSource, IDisposable
     void Check()
     {
         if (_disposed) return;
+        if (Interlocked.Exchange(ref _checking, 1) != 0) return;
         try
         {
+            if (_disposed) return;
             LoopbackSource? c;
             lock (_lock) c = _cur;
 
@@ -73,9 +88,10 @@ public sealed class SystemAudioSource : IAudioSource, IDisposable
             LoopbackSource? old;
             lock (_lock) { old = _cur; _cur = null; }
             try { old?.Dispose(); } catch { }
-            if (def != null) Open();
+            if (def != null && !_disposed) Open();
         }
         catch (Exception e) { _log("检查默认播放设备失败: " + e.Message); }
+        finally { Volatile.Write(ref _checking, 0); }
     }
 
     public void Read(Span<short> stereo, int frames)

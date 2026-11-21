@@ -15,13 +15,19 @@ import { CARDS_CLIP, LAYOUT, preview } from './layout.js';
 const LATENCIES = [0, 100, 250, 500, 1000, 1500, 2000];
 const LADDER = 14;
 
-/** 预览数据：?pair=broken 时两台都报告自己是组长且未成对（与 HomePod 当前的实际报告一致） */
+/** 预览数据：?pair=broken 时两台都报告自己是组长且未成对 */
 function mockDevices() {
   const broken = preview.pair === 'broken';
   return [
-    { name: '起居室 (2)', ip: '192.168.50.71', role: '组长', pairId: 'pair1', unpaired: broken },
-    { name: '起居室', ip: '192.168.50.23', role: broken ? '组长' : '成员', pairId: 'pair1', unpaired: broken },
+    { name: 'Living Room (L)', ip: '192.0.2.10', role: '组长', pairId: 'pair1', unpaired: broken },
+    { name: 'Living Room (R)', ip: '192.0.2.11', role: broken ? '组长' : '成员', pairId: 'pair1', unpaired: broken },
   ];
+}
+
+function errMsg(e) {
+  if (typeof e === 'string') return e;
+  if (e && typeof e.message === 'string' && e.message) return e.message;
+  return String(e || '');
 }
 
 function mockAudioDevices() {
@@ -67,8 +73,8 @@ export default function Panel() {
   const isPreview = preview.active;
   const [conn, setConn] = useState(isPreview ? previewConnection(preview.state) : { state: 'Disconnected', status: '' });
   const [config, setConfig] = useState(isPreview ? {
-    ip: '192.168.50.71',
-    ips: preview.pair === 'broken' ? ['192.168.50.71', '192.168.50.23'] : ['192.168.50.71'],
+    ip: '192.0.2.10',
+    ips: preview.pair === 'broken' ? ['192.0.2.10', '192.0.2.11'] : ['192.0.2.10'],
     volumePercent: preview.volume, latencyMs: 1500, autoReconnect: true, autoConnectOnStart: false,
     showBoard: preview.board, videoSync: false, devices: mockDevices(),
     audioCaptureDeviceId: '', audioDevices: mockAudioDevices(),
@@ -93,22 +99,40 @@ export default function Panel() {
 
   const levelRef = useRef(isPreview ? preview.level : 0);
   const energyRef = useRef(isPreview ? preview.level : 0);
+  const volumeRef = useRef(volume);
+  volumeRef.current = volume;
+  const configRef = useRef(config);
+  configRef.current = config;
   const muteMemory = useRef(volume || 32);
   const dragging = useRef(false);
   const volTimer = useRef(null);
   const hintTimer = useRef(null);
+  const playPending = useRef(false);
+  const audioReq = useRef(0);
   const ipRef = useRef(null);
   const t = useCallback((key, values) => translate(language, key, values), [language]);
+
+  const showHint = useCallback((text, ms = 6000) => {
+    setHint(text);
+    clearTimeout(hintTimer.current);
+    if (text && ms > 0) hintTimer.current = setTimeout(() => setHint(''), ms);
+  }, []);
+
+  useEffect(() => () => {
+    clearTimeout(volTimer.current);
+    clearTimeout(hintTimer.current);
+  }, []);
 
   const mode = useMemo(() => {
     if (conn.state === 'Streaming') return 'streaming';
     if (conn.state === 'Connecting') return 'connecting';
     if (conn.state === 'Reconnecting') return 'reconnecting';
-    if (/连接失败|连接已断开|重连失败|核心进程|connection failed|connection closed|reconnect failed|core process/i.test(conn.status)) return 'failed';
+    if (/连接失败|连接已断开|重连失败|核心进程|操作超时|connection failed|connection closed|reconnect failed|core process/i.test(conn.status)) return 'failed';
     return 'idle';
   }, [conn]);
   const live = mode === 'streaming';
   const busy = mode === 'connecting' || mode === 'reconnecting';
+  const standby = phase === 'standby';
 
   const targets = config.ips?.length ? config.ips : (config.ip ? [config.ip] : []);
   const both = targets.length >= 2;
@@ -134,39 +158,60 @@ export default function Panel() {
   /* ---------- sidecar 事件 ---------- */
   useEffect(() => {
     if (isPreview || !window.hps) return undefined;
+    let alive = true;
+    let gotLiveEvent = false;
     const apply = (cfg) => {
+      if (!cfg) return;
       setConfig(cfg);
-      if (!dragging.current) {
+      if (!dragging.current && typeof cfg.volumePercent === 'number') {
         setVolumeState(cfg.volumePercent);
         if (cfg.volumePercent > 0) muteMemory.current = cfg.volumePercent;
       }
     };
     const off = window.hps.onEvent((ev) => {
+      if (!alive) return;
       switch (ev.ev) {
-        case 'ready': apply(ev.config); setConn({ state: ev.state, status: ev.status }); setLoaded(true); break;
-        case 'state': setConn({ state: ev.state, status: ev.status }); break;
-        case 'config': setConfig(ev.config); break;
+        case 'ready': gotLiveEvent = true; apply(ev.config); setConn({ state: ev.state, status: ev.status }); setLoaded(true); break;
+        case 'state': gotLiveEvent = true; setConn({ state: ev.state, status: ev.status }); break;
+        case 'config': apply(ev.config); break;
         case 'devices': setConfig((c) => ({ ...c, devices: ev.devices })); break;
         case 'level': levelRef.current = ev.value; break;
         case 'scan':
           if (ev.phase === 'start') setScan({ active: true, progress: 0, message: '', count: null });
           else if (ev.phase === 'progress') setScan((s) => ({ ...s, active: true, progress: ev.progress }));
-          else if (ev.phase === 'done') setScan({ active: false, progress: 100, message: '', count: ev.count });
+          else if (ev.phase === 'done') setScan({ active: false, progress: 100, message: '', count: ev.cancelled ? null : ev.count });
           break;
-        case 'error': setConn({ state: 'Disconnected', status: ev.message }); setLoaded(true); break;
+        case 'error': gotLiveEvent = true; setConn({ state: 'Disconnected', status: ev.message || '' }); setLoaded(true); break;
         default: break;
       }
     });
     window.hps.call('state')
-      .then((p) => { setConn({ state: p.state, status: p.status }); apply(p.config); setLoaded(true); })
-      .catch((e) => setConn({ state: 'Disconnected', status: e.message }));
-    return off;
+      .then((p) => {
+        if (!alive || gotLiveEvent) return;
+        setConn({ state: p.state, status: p.status });
+        apply(p.config);
+        setLoaded(true);
+      })
+      .catch((e) => {
+        if (!alive || gotLiveEvent) return;
+        setConn({ state: 'Disconnected', status: errMsg(e) });
+        setLoaded(true);
+      });
+    return () => { alive = false; off(); };
   }, [isPreview]);
 
   /* ---------- 面板开合（由 Rust 通知） ---------- */
   useEffect(() => {
     if (isPreview || !window.hps) return undefined;
+    let alive = true;
+    let raf1 = 0;
+    let raf2 = 0;
+    const cancelShow = () => {
+      if (raf1) { cancelAnimationFrame(raf1); raf1 = 0; }
+      if (raf2) { cancelAnimationFrame(raf2); raf2 = 0; }
+    };
     const off = window.hps.onPanel((what) => {
+      cancelShow();
       if (what === 'land') {
         // 窗口已提前显示并以待命态渲染过，直接展开即可触发绽开过渡
         setEntry('land');
@@ -175,14 +220,22 @@ export default function Panel() {
         // 窗口刚从隐藏变为显示：先以待命态渲染一帧，再展开，保证过渡能播出来
         setEntry('show');
         setPhase('standby');
-        requestAnimationFrame(() => requestAnimationFrame(() => setPhase('open')));
+        raf1 = requestAnimationFrame(() => {
+          raf1 = 0;
+          raf2 = requestAnimationFrame(() => {
+            raf2 = 0;
+            if (alive) setPhase('open');
+          });
+        });
       } else if (what === 'hide') {
         setPhase((p) => (p === 'open' ? 'closing' : p));
       }
     });
     // “show/land” 事件可能早于本页开始监听：加载完主动问一次
-    window.hps.panelVisible().then((v) => { if (v) setPhase((p) => (p === 'standby' ? 'open' : p)); });
-    return off;
+    window.hps.panelVisible().then((v) => {
+      if (alive && v) setPhase((p) => (p === 'standby' ? 'open' : p));
+    });
+    return () => { alive = false; cancelShow(); off(); };
   }, [isPreview]);
 
   useEffect(() => {
@@ -215,11 +268,12 @@ export default function Panel() {
     return () => clearInterval(id);
   }, [mode, isPreview]);
 
-  /* ---------- 光球能量：跟随实时电平 ---------- */
+  /* ---------- 光球能量：跟随实时电平（窗口隐藏于托盘时暂停 rAF 省电） ---------- */
   useEffect(() => {
     if (isPreview) { energyRef.current = live ? preview.level : 0; return undefined; }
+    if (standby) { energyRef.current = 0; return undefined; }
     let raf = 0;
-    let shown = 0;
+    let shown = energyRef.current || 0;
     const tick = () => {
       const target = live ? dbToLevel(levelRef.current) : busy ? 0.15 : 0;
       shown += (target - shown) * (target > shown ? 0.35 : 0.08);
@@ -228,13 +282,15 @@ export default function Panel() {
     };
     tick();
     return () => cancelAnimationFrame(raf);
-  }, [live, busy, isPreview]);
+  }, [live, busy, standby, isPreview]);
 
   useEffect(() => { if (adding) ipRef.current?.focus(); }, [adding]);
 
   /* ---------- 操作 ---------- */
   const changeVolume = useCallback((v) => {
+    if (!Number.isFinite(v)) return;
     v = Math.max(0, Math.min(100, Math.round(v)));
+    volumeRef.current = v;
     setVolumeState(v);
     if (v > 0) muteMemory.current = v;
     if (isPreview || !window.hps) return;
@@ -242,38 +298,41 @@ export default function Panel() {
     volTimer.current = setTimeout(() => window.hps.call('setVolume', { value: v }).catch(() => {}), 60);
   }, [isPreview]);
 
-  function toggleMute() { changeVolume(volume >= 0.5 ? 0 : muteMemory.current || 32); }
+  function toggleMute() { changeVolume(volumeRef.current >= 0.5 ? 0 : muteMemory.current || 32); }
 
   async function togglePlay() {
-    setHint('');
-    if (isPreview || !window.hps || mode === 'connecting') return;
+    showHint('');
+    if (isPreview || !window.hps || mode === 'connecting' || playPending.current) return;
+    playPending.current = true;
     try {
       if (live || mode === 'reconnecting') await window.hps.call('disconnect');
       else {
-        if (!config.ip) { setHint(t('tip.selectDevice')); return; }
+        if (!config.ip) { showHint(t('tip.selectDevice'), 4000); return; }
         await window.hps.call('connect');
       }
-    } catch { /* 失败原因由状态事件带回 */ }
+    } catch (e) {
+      const msg = errMsg(e);
+      if (msg) showHint(msg, 6000);
+    } finally {
+      playPending.current = false;
+    }
   }
 
   async function pickDevice(d) {
-    setHint('');
-    clearTimeout(hintTimer.current);
-    if (isPreview) { setConfig((c) => ({ ...c, ip: d.ip })); return; }
+    showHint('');
+    if (isPreview) { setConfig((c) => ({ ...c, ip: d.ip, ips: [d.ip] })); return; }
     try {
       const r = await window.hps.call('selectDevice', { ip: d.ip });
-      if (r?.hint) {
-        setHint(r.hint);
-        hintTimer.current = setTimeout(() => setHint(''), 6000);
-      }
-    } catch (e) { setHint(e.message); }
+      if (r?.config) setConfig(r.config);
+      if (r?.hint) showHint(r.hint, 6000);
+    } catch (e) { showHint(errMsg(e), 6000); }
   }
 
   async function doScan() {
     if (isPreview) { setScan({ active: false, progress: 100, message: '', count: 2 }); return; }
     setScan({ active: true, progress: 0, message: '', count: null });
     try { await window.hps.call('scan'); }
-    catch (e) { setScan({ active: false, progress: 0, message: e.message, count: null }); }
+    catch (e) { setScan({ active: false, progress: 0, message: errMsg(e), count: null }); }
   }
 
   async function addIp() {
@@ -282,48 +341,53 @@ export default function Panel() {
     if (isPreview) { setIpInput(''); setAdding(false); return; }
     try {
       const r = await window.hps.call('addDevice', { ip: raw });
-      if (r?.hint) {
-        setHint(r.hint);
-        clearTimeout(hintTimer.current);
-        hintTimer.current = setTimeout(() => setHint(''), 6000);
-      }
+      if (r?.config) setConfig(r.config);
+      if (r?.hint) showHint(r.hint, 6000);
       setIpInput('');
       setAdding(false);
-    } catch (e) { setScan((s) => ({ ...s, message: e.message })); }
+    } catch (e) { showHint(errMsg(e), 5000); }
   }
 
   function setOption(key) {
+    const curCfg = configRef.current;
     // showBoard 缺省（旧配置没有这个字段）视为开启
-    const cur = key === 'showBoard' ? config.showBoard !== false : !!config[key];
-    const next = { ...config, [key]: !cur };
+    const prevValue = key === 'showBoard' ? curCfg.showBoard !== false : !!curCfg[key];
+    const next = { ...curCfg, [key]: !prevValue };
+    configRef.current = next;
     setConfig(next);
     if (!isPreview) {
-      window.hps?.call('setOptions', {
-        autoReconnect: next.autoReconnect, autoConnectOnStart: next.autoConnectOnStart,
-        showBoard: next.showBoard !== false, videoSync: !!next.videoSync,
-      }).then((r) => {
+      const payload = {
+        autoReconnect: !!next.autoReconnect,
+        autoConnectOnStart: !!next.autoConnectOnStart,
+        showBoard: next.showBoard !== false,
+        videoSync: !!next.videoSync,
+      };
+      window.hps?.call('setOptions', payload).then((r) => {
         if (!r?.hint) return;
-        setHint(r.hint);
-        clearTimeout(hintTimer.current);
-        hintTimer.current = setTimeout(() => setHint(''), r.hint.length > 40 ? 20000 : 8000);
-      }).catch(() => {});
+        showHint(r.hint, r.hint.length > 40 ? 20000 : 8000);
+      }).catch((e) => {
+        setConfig((c) => ({ ...c, [key]: prevValue }));
+        showHint(errMsg(e), 6000);
+      });
     }
   }
 
   async function openAudioPicker() {
-    setHint('');
+    showHint('');
     setAudioPicker(true);
     if (isPreview || !window.hps) return;
+    const req = ++audioReq.current;
     try {
       const r = await window.hps.call('refreshAudioDevices');
-      if (r?.config) setConfig(r.config);
+      if (req === audioReq.current && r?.config) setConfig(r.config);
     } catch (e) {
-      setHint(e.message);
+      if (req === audioReq.current) showHint(errMsg(e), 6000);
     }
   }
 
   async function pickAudioDevice(id) {
-    setHint('');
+    showHint('');
+    audioReq.current++;
     if (isPreview) {
       setConfig((c) => ({ ...c, audioCaptureDeviceId: id }));
       setAudioPicker(false);
@@ -333,19 +397,26 @@ export default function Panel() {
       const r = await window.hps.call('setAudioDevice', { deviceId: id });
       if (r?.config) setConfig(r.config);
       setAudioPicker(false);
-      setHint(t('status.audioChanged'));
-      clearTimeout(hintTimer.current);
-      hintTimer.current = setTimeout(() => setHint(''), 4000);
+      showHint(t('status.audioChanged'), 4000);
     } catch (e) {
-      setHint(e.message);
+      showHint(errMsg(e), 6000);
     }
   }
 
   function cycleLatency() {
-    const i = LATENCIES.indexOf(config.latencyMs);
-    const ms = LATENCIES[(i - 1 + LATENCIES.length) % LATENCIES.length];
-    setConfig((c) => ({ ...c, latencyMs: ms }));
-    if (!isPreview) window.hps?.call('setLatency', { value: ms }).catch(() => {});
+    const curCfg = configRef.current;
+    const prevMs = curCfg.latencyMs;
+    const i = LATENCIES.indexOf(prevMs);
+    const nextMs = LATENCIES[(i - 1 + LATENCIES.length) % LATENCIES.length];
+    const next = { ...curCfg, latencyMs: nextMs };
+    configRef.current = next;
+    setConfig(next);
+    if (!isPreview) {
+      window.hps?.call('setLatency', { value: nextMs }).catch((e) => {
+        setConfig((c) => ({ ...c, latencyMs: prevMs }));
+        showHint(errMsg(e), 6000);
+      });
+    }
   }
 
   function cycleLanguage() {
@@ -353,10 +424,11 @@ export default function Panel() {
     setLanguage(persistLanguage(next));
   }
 
-  /* ---------- 音量阶梯拖动 ---------- */
+  /* ---------- 音量阶梯拖动与键盘控制 ---------- */
   const ladderRef = useRef(null);
   function volumeFromPointer(e) {
-    const r = ladderRef.current.getBoundingClientRect();
+    const r = ladderRef.current?.getBoundingClientRect();
+    if (!r || r.width <= 0) return volumeRef.current;
     const x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
     return x * 100;
   }
@@ -367,7 +439,15 @@ export default function Panel() {
   }
   function onLadderMove(e) { if (dragging.current) changeVolume(volumeFromPointer(e)); }
   function onLadderUp() { dragging.current = false; }
-  function onVolumeWheel(e) { changeVolume(volume + (e.deltaY < 0 ? 2 : -2)); }
+  function onVolumeWheel(e) { changeVolume(volumeRef.current + (e.deltaY < 0 ? 2 : -2)); }
+  function onLadderKeyDown(e) {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { e.preventDefault(); changeVolume(volumeRef.current + 2); }
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { e.preventDefault(); changeVolume(volumeRef.current - 2); }
+    else if (e.key === 'PageUp') { e.preventDefault(); changeVolume(volumeRef.current + 10); }
+    else if (e.key === 'PageDown') { e.preventDefault(); changeVolume(volumeRef.current - 10); }
+    else if (e.key === 'Home') { e.preventDefault(); changeVolume(0); }
+    else if (e.key === 'End') { e.preventDefault(); changeVolume(100); }
+  }
 
   /* ---------- 文案 ---------- */
   const displayHint = localizeMessage(language, hint);
@@ -560,8 +640,8 @@ export default function Panel() {
         {/* ---------- 右下：音量 ---------- */}
         <section className="card vol glass" onWheel={onVolumeWheel}>
           <div
-            className="ladder" ref={ladderRef} role="slider" aria-label={t('common.volume')} aria-valuemin={0} aria-valuemax={100} aria-valuenow={volume}
-            onPointerDown={onLadderDown} onPointerMove={onLadderMove} onPointerUp={onLadderUp} onPointerCancel={onLadderUp}
+            className="ladder" ref={ladderRef} role="slider" tabIndex={0} aria-label={t('common.volume')} aria-valuemin={0} aria-valuemax={100} aria-valuenow={volume}
+            onPointerDown={onLadderDown} onPointerMove={onLadderMove} onPointerUp={onLadderUp} onPointerCancel={onLadderUp} onKeyDown={onLadderKeyDown}
           >
             {Array.from({ length: LADDER }, (_, i) => {
               const h = 1 + Math.round((i * 4) / (LADDER - 1));
@@ -597,7 +677,7 @@ export default function Panel() {
         disabled={!loaded || mode === 'connecting'}
         onClick={togglePlay}
       >
-        <Orb size={LAYOUT.orbSize} color={orbColor} energyRef={energyRef} still={preview.still} radius={LAYOUT.orbRadius} className="orb" />
+        <Orb size={LAYOUT.orbSize} color={orbColor} energyRef={energyRef} still={preview.still} paused={standby} radius={LAYOUT.orbRadius} className="orb" />
         <span className="orb-ring" />
         <span className="orb-glyph">{live || mode === 'reconnecting' ? <PauseGlyph size={20} /> : <PlayGlyph size={20} />}</span>
       </button>

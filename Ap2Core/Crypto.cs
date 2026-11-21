@@ -20,7 +20,7 @@ public static class Crypto
 }
 
 /// <summary>HAP 控制通道分帧加密：[2 字节小端长度][密文][16 字节标签]，单帧明文 ≤1024，AAD=长度字节</summary>
-public sealed class FrameWriter
+public sealed class FrameWriter : IDisposable
 {
     readonly ChaCha20Poly1305 _c;
     ulong _ctr;
@@ -45,9 +45,11 @@ public sealed class FrameWriter
         }
         return ms.ToArray();
     }
+
+    public void Dispose() => _c.Dispose();
 }
 
-public sealed class FrameReader
+public sealed class FrameReader : IDisposable
 {
     readonly ChaCha20Poly1305 _c;
     ulong _ctr;
@@ -77,6 +79,8 @@ public sealed class FrameReader
         _buf = all.AsSpan(pos).ToArray();
         return outMs.ToArray();
     }
+
+    public void Dispose() => _c.Dispose();
 }
 
 /// <summary>未压缩 ALAC 帧打包</summary>

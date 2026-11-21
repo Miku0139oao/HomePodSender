@@ -8,9 +8,8 @@ namespace Ap2Core.Audio;
 public sealed class LoopbackSource : IAudioSource, IDisposable
 {
     readonly LoopbackCapture _cap;
-    readonly Action<string> _log;
     readonly object _sync = new();
-    readonly float[] _tmp = new float[Ap2Session.Frames * 2];
+    float[] _tmp = new float[Ap2Session.Frames * 2];
     StreamResampler? _rs;
     int _target;                  // 目标缓冲（输入帧数，约 40ms）
     double _avg;                  // 缓冲余量的平滑值
@@ -18,26 +17,39 @@ public sealed class LoopbackSource : IAudioSource, IDisposable
     long _lastDataTicks;
     float _peak;
 
-    public long Underruns, Overruns;
+    long _underruns, _overruns;
+    public long Underruns => Interlocked.Read(ref _underruns);
+    public long Overruns => Interlocked.Read(ref _overruns);
     public string DeviceId => _cap.DeviceId;
     public MixFormat? Format => _cap.Format;
     /// <summary>抓取意外结束（设备变化等）</summary>
     public event Action<string>? CaptureStopped;
 
-    public LoopbackSource(Action<string> log, string? deviceId = null)
+    public LoopbackSource(Action<string> log, string? deviceId = null, Action<LoopbackSource, string>? onStopped = null)
     {
-        _log = log;
         _cap = new LoopbackCapture(log, deviceId);
         _cap.DataAvailable += OnData;
-        _cap.Stopped += why => CaptureStopped?.Invoke(why);
-        _cap.Start();
+        _cap.Stopped += why =>
+        {
+            onStopped?.Invoke(this, why);
+            CaptureStopped?.Invoke(why);
+        };
+        try
+        {
+            _cap.Start();
+        }
+        catch
+        {
+            _cap.Dispose();
+            throw;
+        }
     }
 
     /// <summary>当前缓冲余量（毫秒，按设备采样率换算），供诊断</summary>
     public double BufferedMs { get { lock (_sync) { var f = _cap.Format; return _rs == null || f == null ? 0 : _rs.BufferedFrames * 1000.0 / f.SampleRate; } } }
 
     /// <summary>最近一段时间的峰值电平（0..1），读取后清零，供界面显示电平条</summary>
-    public float TakePeak() { lock (_sync) { var p = _peak; _peak = 0; return p; } }
+    public float TakePeak() { lock (_sync) { var p = _peak; _peak = 0; return float.IsFinite(p) ? p : 0f; } }
 
     void OnData(float[] stereo, int frames)
     {
@@ -47,10 +59,16 @@ public sealed class LoopbackSource : IAudioSource, IDisposable
             {
                 var f = _cap.Format!;
                 _rs = new StreamResampler(f.SampleRate, Ap2Session.Rate);
-                _target = f.SampleRate * 40 / 1000;
+                _target = Math.Max(1, f.SampleRate * 40 / 1000);
             }
+            long now = Environment.TickCount64;
+            if (!_primed && _lastDataTicks > 0 && now - _lastDataTicks > 250)
+                _rs.Reset();
             _rs.Push(stereo, frames);
-            _lastDataTicks = Environment.TickCount64;
+            // 防止连接等待期间或 Read 未调用时缓冲无限增长
+            int maxCap = Math.Max(_target * 10, 4096);
+            if (_rs.BufferedFrames > maxCap) _rs.TrimTo(_target * 2);
+            _lastDataTicks = now;
         }
     }
 
@@ -68,26 +86,34 @@ public sealed class LoopbackSource : IAudioSource, IDisposable
                 _avg = buffered;
             }
 
+            if (buffered > _target * 6)
+            {
+                _rs.TrimTo(_target);
+                buffered = _rs.BufferedFrames;
+                _avg = buffered;
+                Interlocked.Increment(ref _overruns);
+            }
             _avg = _avg * 0.99 + buffered * 0.01;
             double err = (_avg - _target) / _target;
             double adj = Math.Clamp(err * 0.002, -0.002, 0.002);
-            if (buffered > _target * 6) { _rs.TrimTo(_target); Overruns++; }
 
+            if (_tmp.Length < frames * 2) _tmp = new float[frames * 2];
             int got = _rs.Pull(_tmp, frames, adj);
             float peak = _peak;
             for (int i = 0; i < got * 2; i++)
             {
                 float v = _tmp[i];
+                if (!float.IsFinite(v)) v = 0f;
                 float av = Math.Abs(v);
-                if (av > peak) peak = av;
-                stereo[i] = (short)Math.Clamp(v * 32767f, -32768f, 32767f);
+                if (av > peak) peak = Math.Min(av, 1f);
+                stereo[i] = (short)Math.Clamp(MathF.Round(v * 32767f), -32768f, 32767f);
             }
             _peak = peak;
             if (got < frames)
             {
                 stereo.Slice(got * 2, (frames - got) * 2).Clear();
                 _primed = false;   // 数据断档：重新预缓冲
-                if (Environment.TickCount64 - _lastDataTicks < 200) Underruns++;
+                if (Environment.TickCount64 - _lastDataTicks < 200) Interlocked.Increment(ref _underruns);
             }
         }
     }

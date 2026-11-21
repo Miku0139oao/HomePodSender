@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -16,8 +18,10 @@ namespace HomePodSidecar;
 internal static class Program
 {
     static readonly object WriteLock = new();
-    /// <summary>设备列表会被扫描、探测、选择等并发命令修改，读写都经过这把锁</summary>
+    /// <summary>配置读写都经过这把锁（不在此锁内做耗时的 COM 枚举）</summary>
     static readonly object CfgLock = new();
+    static readonly object ScanLock = new();
+    static readonly object SaveLock = new();
     static readonly SemaphoreSlim Control = new(1, 1);
     static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
@@ -26,8 +30,15 @@ internal static class Program
     static Stream _out = null!;
     static CancellationTokenSource? _scanCts;
     static Timer? _saveTimer;
-    static volatile bool _stopping;
+    static int _stopping;
     static LipSyncServer? _lip;
+
+    static bool Stopping => Volatile.Read(ref _stopping) != 0;
+
+    sealed class SyncProgress<T>(Action<T> onReport) : IProgress<T>
+    {
+        public void Report(T value) => onReport(value);
+    }
 
     static async Task<int> Main(string[] args)
     {
@@ -49,17 +60,19 @@ internal static class Program
         _ = Task.Run(LevelLoop);
         StartLipSync();
         Send(new { ev = "ready", state = _ctl.State.ToString(), status = _ctl.Status, config = Snapshot() });
-        if (_cfg.AutoConnectOnStart) _ = Task.Run(ConnectCore);   // 连接前会自行校正立体声对目标
-        else
+        bool autoConnect;
+        List<string> pairIps;
+        lock (CfgLock)
         {
-            // 后台校正立体声对角色，修正旧配置里过期或错误的组长标记
-            var pairIps = _cfg.Devices.Where(d => !string.IsNullOrEmpty(d.PairId)).Select(d => d.Ip).ToList();
-            if (pairIps.Count > 0) _ = Task.Run(() => RefreshRolesAsync(pairIps));
+            autoConnect = _cfg.AutoConnectOnStart;
+            pairIps = _cfg.Devices.Where(d => !string.IsNullOrEmpty(d.PairId)).Select(d => d.Ip).ToList();
         }
+        if (autoConnect) _ = ConnectCore();   // 连接前会自行校正立体声对目标
+        else if (pairIps.Count > 0) _ = Task.Run(() => RefreshRolesAsync(pairIps));
         _ = Task.Run(RoleRefreshLoop);   // 角色会随播放状态变化，定期重读才能记住真正的组长
         Logger.Write("sidecar 启动");
 
-        while (!_stopping)
+        while (!Stopping)
         {
             string? text;
             try { text = await input.ReadLineAsync(); }
@@ -70,6 +83,11 @@ internal static class Program
             try
             {
                 using var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                {
+                    Send(new { ev = "error", message = "bad json" });
+                    continue;
+                }
                 msg = doc.RootElement.Clone();
             }
             catch { Send(new { ev = "error", message = "bad json" }); continue; }
@@ -79,13 +97,38 @@ internal static class Program
         return 0;
     }
 
+    static bool TryParseIpv4(string raw, out string normalized)
+    {
+        normalized = "";
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        string trimmed = raw.Trim();
+        if (IPAddress.TryParse(trimmed, out var direct) && direct.AddressFamily == AddressFamily.InterNetwork)
+        {
+            normalized = direct.ToString();
+            return true;
+        }
+        var m = Regex.Match(trimmed, @"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])");
+        if (m.Success && IPAddress.TryParse(m.Groups[1].Value, out var extracted) && extracted.AddressFamily == AddressFamily.InterNetwork)
+        {
+            normalized = extracted.ToString();
+            return true;
+        }
+        return false;
+    }
+
     // ---------- 命令 ----------
     static async Task Handle(JsonElement msg)
     {
-        long id = msg.TryGetProperty("id", out var idEl) && idEl.TryGetInt64(out var v) ? v : 0;
-        string cmd = Str(msg, "cmd");
+        long id = 0;
         try
         {
+            if (msg.ValueKind != JsonValueKind.Object)
+            {
+                Send(new { ev = "error", message = "bad json" });
+                return;
+            }
+            id = msg.TryGetProperty("id", out var idEl) && idEl.TryGetInt64(out var v) ? v : 0;
+            string cmd = Str(msg, "cmd");
             switch (cmd)
             {
                 case "state":
@@ -108,8 +151,12 @@ internal static class Program
 
                 case "setVolume":
                 {
-                    int pct = Math.Clamp(Int(msg, "value", _cfg.VolumePercent), 0, 100);
-                    _cfg.VolumePercent = pct;
+                    int pct;
+                    lock (CfgLock)
+                    {
+                        pct = Math.Clamp(Int(msg, "value", _cfg.VolumePercent), 0, 100);
+                        _cfg.VolumePercent = pct;
+                    }
                     _ctl.SetVolumePercent(pct);
                     SaveSoon();
                     Reply(id, new { volumePercent = pct });
@@ -118,8 +165,12 @@ internal static class Program
 
                 case "setLatency":
                 {
-                    int ms = Math.Clamp(Int(msg, "value", _cfg.LatencyMs), 0, 2000);
-                    _cfg.LatencyMs = ms;
+                    int ms;
+                    lock (CfgLock)
+                    {
+                        ms = Math.Clamp(Int(msg, "value", _cfg.LatencyMs), 0, 2000);
+                        _cfg.LatencyMs = ms;
+                    }
                     _ctl.Settings.LatencyMs = ms;
                     SaveNow();
                     Reply(id, new { latencyMs = ms });
@@ -133,22 +184,34 @@ internal static class Program
                     if (endpointId.Length > 0 && endpoints.All(x => x.Id != endpointId))
                         throw new InvalidOperationException("选择的音频输出设备当前不可用");
 
-                    bool changed = endpointId != _cfg.AudioCaptureDeviceId;
-                    bool restart = changed && _ctl.State != StreamState.Disconnected;
-                    if (changed)
+                    bool changed;
+                    bool restart = false;
+                    object snap;
+                    await Control.WaitAsync();
+                    try
                     {
-                        string selected = endpointId.Length == 0
-                            ? "跟随 Windows 默认播放设备"
-                            : endpoints.First(x => x.Id == endpointId).Name;
-                        Logger.Write("切换音频来源: " + selected);
-                        _cfg.AudioCaptureDeviceId = endpointId;
-                        _ctl.Settings.AudioCaptureDeviceId = endpointId;
-                        SaveNow();
-                        Send(new { ev = "config", config = Snapshot() });
+                        lock (CfgLock)
+                        {
+                            changed = endpointId != _cfg.AudioCaptureDeviceId;
+                            if (changed) _cfg.AudioCaptureDeviceId = endpointId;
+                        }
+                        restart = changed && _ctl.State != StreamState.Disconnected;
+                        if (changed)
+                        {
+                            string selected = endpointId.Length == 0
+                                ? "跟随 Windows 默认播放设备"
+                                : endpoints.First(x => x.Id == endpointId).Name;
+                            Logger.Write("切换音频来源: " + selected);
+                            _ctl.Settings.AudioCaptureDeviceId = endpointId;
+                            SaveNow();
+                        }
+                        snap = Snapshot(endpoints);
+                        if (changed) Send(new { ev = "config", config = snap });
+                        if (restart) await _ctl.DisconnectAsync();
                     }
-                    if (restart) await _ctl.DisconnectAsync();
-                    Reply(id, new { audioCaptureDeviceId = endpointId, config = Snapshot() });
-                    if (restart) _ = Task.Run(ConnectCore);
+                    finally { Control.Release(); }
+                    Reply(id, new { audioCaptureDeviceId = endpointId, config = snap });
+                    if (restart) _ = ConnectCore();
                     break;
                 }
 
@@ -158,16 +221,22 @@ internal static class Program
 
                 case "setOptions":
                 {
-                    bool ar = Bool(msg, "autoReconnect", _cfg.AutoReconnect);
-                    bool ac = Bool(msg, "autoConnectOnStart", _cfg.AutoConnectOnStart);
-                    bool sb = Bool(msg, "showBoard", _cfg.ShowBoard);
-                    bool vs = Bool(msg, "videoSync", _cfg.VideoSync);
-                    _cfg.AutoReconnect = ar;
+                    bool ar, ac, sb, vs, vsChanged;
+                    lock (CfgLock)
+                    {
+                        bool prevVs = _cfg.VideoSync;
+                        ar = Bool(msg, "autoReconnect", _cfg.AutoReconnect);
+                        ac = Bool(msg, "autoConnectOnStart", _cfg.AutoConnectOnStart);
+                        sb = Bool(msg, "showBoard", _cfg.ShowBoard);
+                        vs = Bool(msg, "videoSync", _cfg.VideoSync);
+                        _cfg.AutoReconnect = ar;
+                        _cfg.AutoConnectOnStart = ac;
+                        _cfg.ShowBoard = sb;
+                        _cfg.VideoSync = vs;
+                        vsChanged = vs != prevVs;
+                    }
                     _ctl.Settings.AutoReconnect = ar;
-                    _cfg.AutoConnectOnStart = ac;
-                    _cfg.ShowBoard = sb;
-                    _cfg.VideoSync = vs;
-                    string hint = ApplyVideoSync();
+                    string hint = vsChanged ? ApplyVideoSync() : "";
                     SaveNow();
                     Reply(id, new { autoReconnect = ar, autoConnectOnStart = ac, showBoard = sb, videoSync = vs, hint });
                     break;
@@ -184,11 +253,12 @@ internal static class Program
                 case "addDevice":
                 {
                     string raw = Str(msg, "ip");
-                    var m = Regex.Match(raw, @"(\d{1,3}(?:\.\d{1,3}){3})");
-                    if (!m.Success || !IPAddress.TryParse(m.Groups[1].Value, out _))
+                    if (!TryParseIpv4(raw, out string ip))
                         throw new InvalidOperationException("请输入有效的 IP 地址");
-                    string ip = m.Groups[1].Value;
-                    if (_cfg.Devices.All(d => d.Ip != ip)) _cfg.Devices.Add(new DeviceEntry { Ip = ip });
+                    lock (CfgLock)
+                    {
+                        if (_cfg.Devices.All(d => d.Ip != ip)) _cfg.Devices.Add(new DeviceEntry { Ip = ip });
+                    }
                     SaveNow();
                     SendDevices();
                     // 先探测再选：手工加的 IP 如果其实是成员，要等角色读回来才能改连组长，不能先连上去
@@ -208,29 +278,71 @@ internal static class Program
 
                 case "scan":
                 {
-                    _scanCts?.Cancel();
-                    var cts = _scanCts = new CancellationTokenSource();
+                    CancellationTokenSource cts;
+                    CancellationTokenSource? prev;
+                    lock (ScanLock)
+                    {
+                        prev = _scanCts;
+                        cts = _scanCts = new CancellationTokenSource();
+                    }
+                    try { prev?.Cancel(); prev?.Dispose(); } catch { }
                     Send(new { ev = "scan", phase = "start" });
-                    var found = await Task.Run(() => Discovery.ScanAsync(
-                        cts.Token, new Progress<int>(p => Send(new { ev = "scan", phase = "progress", progress = p }))));
-                    if (cts.IsCancellationRequested) { Reply(id, new { cancelled = true }); break; }
-                    ApplyFound(found);
-                    SaveNow();
-                    SendDevices();
-                    Send(new { ev = "scan", phase = "done", count = found.Count });
-                    Reply(id, new { count = found.Count, config = Snapshot() });
+                    try
+                    {
+                        var found = await Task.Run(() => Discovery.ScanAsync(
+                            cts.Token,
+                            new SyncProgress<int>(p =>
+                            {
+                                if (!cts.IsCancellationRequested)
+                                    Send(new { ev = "scan", phase = "progress", progress = p });
+                            })));
+                        if (cts.IsCancellationRequested)
+                        {
+                            Send(new { ev = "scan", phase = "done", cancelled = true, count = 0 });
+                            Reply(id, new { cancelled = true });
+                            break;
+                        }
+                        ApplyFound(found);
+                        SaveNow();
+                        SendDevices();
+                        Send(new { ev = "scan", phase = "done", count = found.Count });
+                        Reply(id, new { count = found.Count, config = Snapshot() });
+                    }
+                    catch
+                    {
+                        Send(new { ev = "scan", phase = "done", cancelled = true, count = 0 });
+                        throw;
+                    }
+                    finally
+                    {
+                        bool disposeNow = false;
+                        lock (ScanLock)
+                        {
+                            if (ReferenceEquals(_scanCts, cts)) _scanCts = null;
+                            disposeNow = true;
+                        }
+                        if (disposeNow) { try { cts.Dispose(); } catch { } }
+                    }
                     break;
                 }
 
                 case "cancelScan":
-                    _scanCts?.Cancel();
+                {
+                    CancellationTokenSource? cur;
+                    lock (ScanLock) cur = _scanCts;
+                    try { cur?.Cancel(); } catch { }
                     Reply(id, new { cancelled = true });
                     break;
+                }
 
                 case "refreshDevices":
-                    await RefreshRolesAsync(_cfg.Devices.Select(d => d.Ip).ToList());
+                {
+                    List<string> ips;
+                    lock (CfgLock) ips = _cfg.Devices.Select(d => d.Ip).ToList();
+                    await RefreshRolesAsync(ips);
                     Reply(id, new { config = Snapshot() });
                     break;
+                }
 
                 case "quit":
                     Reply(id, new { });
@@ -244,7 +356,7 @@ internal static class Program
         }
         catch (Exception e)
         {
-            string reason = _ctl.State == StreamState.Disconnected ? e.Message : _ctl.Status;
+            string reason = string.IsNullOrWhiteSpace(e.Message) ? "操作失败" : e.Message;
             Send(new { ev = "state", state = _ctl.State.ToString(), status = _ctl.Status });
             Reply(id, new { error = reason, state = _ctl.State.ToString(), status = _ctl.Status }, ok: false);
         }
@@ -323,68 +435,87 @@ internal static class Program
     /// <summary>连接前确认目标：若当前目标是立体声对的成员，改连组长并通知界面</summary>
     static async Task RetargetToLeaderAsync()
     {
-        var target = await CurrentLeaderAsync(_cfg.Ip);
-        if (target.Ip == _cfg.Ip) return;
-        Logger.Write($"目标 {_cfg.Ip} 是立体声对成员，改连组长 {target.Ip}");
-        _cfg.Ip = target.Ip;
+        string currentIp;
+        lock (CfgLock) currentIp = _cfg.Ip;
+        var target = await CurrentLeaderAsync(currentIp);
+        if (target.Ip == currentIp) return;
+        Logger.Write($"目标 {currentIp} 是立体声对成员，改连组长 {target.Ip}");
+        lock (CfgLock) _cfg.Ip = target.Ip;
         _ctl.Settings.Ip = target.Ip;
         SaveNow();
         Send(new { ev = "config", config = Snapshot() });
     }
 
-    static async Task<(string Ip, string Hint)> SelectDeviceAsync(string ip)
+    static async Task<(string Ip, string Hint)> SelectDeviceAsync(string rawIp)
     {
-        if (string.IsNullOrWhiteSpace(ip) || !IPAddress.TryParse(ip, out _)) throw new InvalidOperationException("无效的 IP 地址");
+        if (!TryParseIpv4(rawIp, out string ip)) throw new InvalidOperationException("无效的 IP 地址");
         // 立体声对：成对时点成员改连组长；两台都自称组长时按你点的设备连，但提示未成对
-        var target = await CurrentLeaderAsync(ip);
-        List<string> next;
-        List<string> current;
-        lock (CfgLock) next = Discovery.PlaybackTargets(target.Ip, _cfg.Devices);
-        current = _ctl.Settings.Ips.Count > 0 ? _ctl.Settings.Ips.ToList() : new List<string> { _cfg.Ip };
-        bool same = next.Count == current.Count && next.All(current.Contains);
+        await Control.WaitAsync();
+        bool restart = false;
+        string targetIp;
         string hint;
-        lock (CfgLock)
+        try
         {
-            var now = _cfg.Devices.FirstOrDefault(d => d.Ip == target.Ip);
-            // 两台都未成对时会各开一路；只剩一台可连时才提示“仅此一台”
-            hint = next.Count >= 2 ? "" : now?.Unpaired == true ? $"未组立体声对，只会从 {target.Ip} 这一台出声" : "";
-        }
-        bool active = _ctl.State != StreamState.Disconnected;
-        _cfg.Ip = target.Ip;
-        _ctl.Settings.Ip = target.Ip;
-        _ctl.Settings.Ips = next;
-        // 两台一起播时，在这两台之间切换不必拆掉会话再重连
-        if (same)
-        {
+            var target = await CurrentLeaderAsync(ip);
+            targetIp = target.Ip;
+            List<string> next;
+            List<string> current;
+            lock (CfgLock)
+            {
+                next = Discovery.PlaybackTargets(targetIp, _cfg.Devices);
+                current = _ctl.Settings.Ips.Count > 0 ? _ctl.Settings.Ips.ToList() : new List<string> { _cfg.Ip };
+                var now = _cfg.Devices.FirstOrDefault(d => d.Ip == targetIp);
+                // 两台都未成对时会各开一路；只剩一台可连时才提示“仅此一台”
+                hint = next.Count >= 2 ? "" : now?.Unpaired == true ? $"未组立体声对，只会从 {targetIp} 这一台出声" : "";
+                _cfg.Ip = targetIp;
+            }
+            bool same = next.Count == current.Count && next.All(current.Contains);
+            bool active = _ctl.State != StreamState.Disconnected;
+            _ctl.Settings.Ip = targetIp;
+            _ctl.Settings.Ips = next;
+            // 两台一起播时，在这两台之间切换不必拆掉会话再重连
+            if (same)
+            {
+                SaveNow();
+                Send(new { ev = "config", config = Snapshot() });
+                return (targetIp, hint);
+            }
+            if (active)
+            {
+                await _ctl.DisconnectAsync();
+                restart = true;
+            }
             SaveNow();
             Send(new { ev = "config", config = Snapshot() });
-            return (target.Ip, hint);
         }
-        if (active) await _ctl.DisconnectAsync();
-        SaveNow();
-        Send(new { ev = "config", config = Snapshot() });
-        if (active) _ = Task.Run(ConnectCore);
-        return (target.Ip, hint);
+        finally { Control.Release(); }
+        if (restart) _ = ConnectCore();
+        return (targetIp, hint);
     }
 
     /// <summary>按当前角色决定推一台还是两台，并写进控制器。成对时只有组长</summary>
     static void ApplyPlaybackTargets()
     {
         List<string> ips;
-        lock (CfgLock) ips = Discovery.PlaybackTargets(_cfg.Ip, _cfg.Devices);
+        string cfgIp;
+        lock (CfgLock)
+        {
+            cfgIp = _cfg.Ip;
+            ips = Discovery.PlaybackTargets(cfgIp, _cfg.Devices);
+        }
         _ctl.Settings.Ips = ips;
         if (ips.Count == 1) _ctl.Settings.Ip = ips[0];
-        else if (!string.IsNullOrEmpty(_cfg.Ip)) _ctl.Settings.Ip = _cfg.Ip;
+        else if (!string.IsNullOrEmpty(cfgIp)) _ctl.Settings.Ip = cfgIp;
         if (ips.Count >= 2) Logger.Write("同时推流到 " + string.Join(" 和 ", ips));
     }
 
     /// <summary>角色随播放状态变化（播放 / 空闲时 igl、pgid 不同）；定期重读，才能记住真正的组长并刷新界面</summary>
     static async Task RoleRefreshLoop()
     {
-        while (!_stopping)
+        while (!Stopping)
         {
             try { await Task.Delay(30_000); } catch { return; }
-            if (_stopping) return;
+            if (Stopping) return;
             List<string> ips;
             lock (CfgLock) ips = _cfg.Devices.Where(d => !string.IsNullOrEmpty(d.PairId)).Select(d => d.Ip).ToList();
             if (ips.Count == 0) continue;
@@ -413,11 +544,22 @@ internal static class Program
     // ---------- 事件 ----------
     static async Task LevelLoop()
     {
-        while (!_stopping)
+        while (!Stopping)
         {
-            await Task.Delay(50);
-            if (_ctl.State == StreamState.Streaming)
-                Send(new { ev = "level", value = _ctl.TakePeak() });
+            try
+            {
+                await Task.Delay(50);
+                if (_ctl.State == StreamState.Streaming)
+                {
+                    float peak = _ctl.TakePeak();
+                    if (!float.IsFinite(peak)) peak = 0f;
+                    Send(new { ev = "level", value = peak });
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.Write("电平采样异常: " + e.Message);
+            }
         }
     }
 
@@ -431,8 +573,12 @@ internal static class Program
                 .Cast<object>().ToArray();
     }
 
-    static object Snapshot()
+    static object Snapshot(IReadOnlyList<AudioEndpoint>? prefetchedEndpoints = null)
     {
+        // 在 CfgLock 外枚举 COM 音频端点，避免卡住配置读写与 /lipsync 查询
+        var audioDevices = prefetchedEndpoints != null
+            ? prefetchedEndpoints.Select(x => new { id = x.Id, name = x.Name, isDefault = x.IsDefault }).Cast<object>().ToArray()
+            : AudioDeviceList();
         lock (CfgLock)
             return new
             {
@@ -446,8 +592,10 @@ internal static class Program
                 videoSync = _cfg.VideoSync,
                 deviceId = _cfg.DeviceId,
                 audioCaptureDeviceId = _cfg.AudioCaptureDeviceId,
-                audioDevices = AudioDeviceList(),
-                devices = DeviceList(),
+                audioDevices,
+                devices = _cfg.Devices
+                    .Select(d => new { name = d.Name, ip = d.Ip, role = d.Role, pairId = d.PairId, unpaired = d.Unpaired })
+                    .Cast<object>().ToArray(),
             };
     }
 
@@ -472,12 +620,21 @@ internal static class Program
 
     static void Send(object o)
     {
+        byte[] bytes;
         try
         {
-            byte[] bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(o, Json) + "\n");
+            bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(o, Json) + "\n");
+        }
+        catch (Exception e)
+        {
+            Logger.Write("序列化事件失败: " + e.Message);
+            return;
+        }
+        try
+        {
             lock (WriteLock) { _out.Write(bytes, 0, bytes.Length); _out.Flush(); }
         }
-        catch { /* 宿主已退出 */ }
+        catch { /* 宿主管道已关闭 */ }
     }
 
     static string Str(JsonElement m, string name) =>
@@ -492,10 +649,12 @@ internal static class Program
 
     static void SaveSoon()
     {
-        if (_saveTimer == null)
-            _saveTimer = new Timer(_ => SaveNow(), null, 500, Timeout.Infinite);
-        else
-            _saveTimer.Change(500, Timeout.Infinite);
+        lock (SaveLock)
+        {
+            if (Stopping) return;
+            _saveTimer ??= new Timer(_ => SaveNow(), null, Timeout.Infinite, Timeout.Infinite);
+            try { _saveTimer.Change(500, Timeout.Infinite); } catch (ObjectDisposedException) { }
+        }
     }
 
     static void SaveNow() { try { lock (CfgLock) _cfg.Save(); } catch { } }
@@ -516,7 +675,9 @@ internal static class Program
             Logger.Write("画面对齐服务没起来: " + ex.Message);
             return;
         }
-        if (!_cfg.VideoSync) return;
+        bool enabled;
+        lock (CfgLock) enabled = _cfg.VideoSync;
+        if (!enabled) return;
         try { Logger.Write("插件目录 " + _lip.ExportUnpacked()); }
         catch (Exception ex) { Logger.Write("导出插件失败: " + ex.Message); }
         try
@@ -537,9 +698,10 @@ internal static class Program
         try { folder = _lip.ExportUnpacked(); }
         catch (Exception ex) { Logger.Write("导出插件失败: " + ex.Message); }
         double sec;
-        lock (CfgLock) sec = _cfg.LatencyMs / 1000.0;
-        string late = sec.ToString("0.#");
-        if (_cfg.VideoSync)
+        bool enabled;
+        lock (CfgLock) { sec = _cfg.LatencyMs / 1000.0; enabled = _cfg.VideoSync; }
+        string late = sec.ToString("0.#", CultureInfo.InvariantCulture);
+        if (enabled)
         {
             if (EnsurePolicy(_lip.ExtensionId, _lip.Port))
                 return "对齐画面已打开。保持本程序运行，然后完全退出并重新打开一次 Chrome。网页画面会晚 " + late + " 秒，声音仍马上送出。";
@@ -604,7 +766,7 @@ internal static class Program
                 WindowStyle = ProcessWindowStyle.Hidden,
             });
             if (p == null) return false;
-            if (!p.WaitForExit(60000)) return false;
+            if (!p.WaitForExit(30000)) return false;
             return p.ExitCode == 0;
         }
         catch (Exception ex)
@@ -648,22 +810,35 @@ internal static class Program
         if (folder.Length == 0 || !Directory.Exists(folder)) return;
         try
         {
-            Process.Start(new ProcessStartInfo { FileName = "explorer.exe", Arguments = folder, UseShellExecute = true });
+            var psi = new ProcessStartInfo
+            {
+                FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add(folder);
+            Process.Start(psi);
         }
         catch { /* 打不开文件夹不影响提示文字 */ }
     }
 
     static void Shutdown()
     {
-        if (_stopping) return;
-        _stopping = true;
-        try { _scanCts?.Cancel(); } catch { }
-        try { _saveTimer?.Dispose(); } catch { }
+        if (Interlocked.Exchange(ref _stopping, 1) != 0) return;
+        lock (SaveLock)
+        {
+            try { _saveTimer?.Dispose(); } catch { }
+            _saveTimer = null;
+        }
+        // 先落盘配置，避免宿主强杀前尚未保存防抖的音量或选项
+        SaveNow();
+        lock (ScanLock)
+        {
+            try { _scanCts?.Cancel(); } catch { }
+        }
         try { _ctl.Dispose(); } catch { }
         try { _lip?.Dispose(); } catch { }
-        SaveNow();
         Logger.Write("sidecar 退出");
-        try { _out.Flush(); } catch { }
+        try { lock (WriteLock) _out.Flush(); } catch { }
         Environment.Exit(0);
     }
 
@@ -672,33 +847,46 @@ internal static class Program
     {
         Console.OutputEncoding = Encoding.UTF8;
         var cfg = AppConfig.Load();
-        string ip = args.Length > 1 ? args[1] : cfg.Ip;
-        double seconds = args.Length > 2 && double.TryParse(args[2], out var s) ? s : 10;
-        double volumeDb = args.Length > 3 && double.TryParse(args[3], out var v) ? v : -6;
-        seconds = Math.Clamp(seconds, 1, 60);
-        using var session = new Ap2Session(new Ap2Options
+        string rawIp = args.Length > 1 ? args[1] : cfg.Ip;
+        if (!TryParseIpv4(rawIp, out string ip))
         {
-            Ip = ip,
-            Port = 7000,
-            LatencyFrames = 500 * Ap2Session.Rate / 1000,
-            DeviceId = cfg.DeviceId,
-        });
-        session.LogMessage += Console.WriteLine;
+            Console.WriteLine("测试音失败: 请提供有效的 HomePod IPv4 地址");
+            return 1;
+        }
+        double seconds = args.Length > 2 && double.TryParse(args[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var s) ? s : 10;
+        double volumeDb = args.Length > 3 && double.TryParse(args[3], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : -6;
+        seconds = Math.Clamp(seconds, 1, 60);
         try
         {
-            await session.ConnectAsync();
-            await session.SetVolumeDbAsync(volumeDb);
-            session.StartStreaming(new ToneSource(440));
-            Console.WriteLine($"播放 440 Hz 测试音 {seconds:0.#} 秒，音量 {volumeDb:0.#} dB");
-            await Task.Delay(TimeSpan.FromSeconds(seconds));
-            Console.WriteLine($"统计: 音频包 {session.AudioPackets} 同步包 {session.SyncPackets} 授时应答 {session.TimingReplies}");
-            await session.StopAsync();
-            return 0;
+            using var session = new Ap2Session(new Ap2Options
+            {
+                Ip = ip,
+                Port = 7000,
+                LatencyFrames = 500 * Ap2Session.Rate / 1000,
+                DeviceId = cfg.DeviceId,
+            });
+            session.LogMessage += Console.WriteLine;
+            try
+            {
+                await session.ConnectAsync();
+                await session.SetVolumeDbAsync(volumeDb);
+                session.StartStreaming(new ToneSource(440));
+                Console.WriteLine($"播放 440 Hz 测试音 {seconds:0.#} 秒，音量 {volumeDb:0.#} dB");
+                await Task.Delay(TimeSpan.FromSeconds(seconds));
+                Console.WriteLine($"统计: 音频包 {session.AudioPackets} 同步包 {session.SyncPackets} 授时应答 {session.TimingReplies}");
+                await session.StopAsync();
+                return 0;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("测试音失败: " + e.Message);
+                try { await session.StopAsync(); } catch { }
+                return 1;
+            }
         }
         catch (Exception e)
         {
             Console.WriteLine("测试音失败: " + e.Message);
-            try { await session.StopAsync(); } catch { }
             return 1;
         }
     }

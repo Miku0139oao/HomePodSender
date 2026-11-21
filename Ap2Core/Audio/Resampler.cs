@@ -19,6 +19,7 @@ public sealed class StreamResampler
 
     public StreamResampler(int inRate, int outRate)
     {
+        if (inRate <= 0 || outRate <= 0) throw new ArgumentOutOfRangeException(nameof(inRate), "采样率必须大于 0");
         _baseStep = (double)inRate / outRate;
         _table = BuildTable(Math.Min(1.0, (double)outRate / inRate) * 0.95);
         _buf = new float[(Half * 2 + 4096) * 2];
@@ -70,6 +71,7 @@ public sealed class StreamResampler
     /// <summary>追加输入（交错立体声浮点）</summary>
     public void Push(ReadOnlySpan<float> stereo, int frames)
     {
+        if (frames <= 0) return;
         int need = (_count + frames) * 2;
         if (need > _buf.Length)
         {
@@ -84,6 +86,7 @@ public sealed class StreamResampler
     /// <summary>丢弃缓冲中最旧的输入，只保留 keepFrames 帧（用于积压过多时追平）</summary>
     public void TrimTo(int keepFrames)
     {
+        if (keepFrames < 0) keepFrames = 0;
         int avail = BufferedFrames;
         if (avail <= keepFrames) return;
         _pos += avail - keepFrames;   // 直接把读位置前移
@@ -113,7 +116,7 @@ public sealed class StreamResampler
     /// </summary>
     public int Pull(Span<float> output, int frames, double rateAdjust = 0)
     {
-        double step = _baseStep * (1.0 + rateAdjust);
+        double step = _baseStep * (1.0 + Math.Clamp(rateAdjust, -0.5, 0.5));
         int produced = 0;
         while (produced < frames)
         {

@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "intro",
+  "description": "启动动画窗口最小权限",
+  "windows": [
+    "intro"
+  ],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}

@@ -5,10 +5,10 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 function subscribe(name, cb) {
   let unlisten = null;
   let dead = false;
-  listen(name, (e) => cb(e.payload)).then((fn) => {
+  listen(name, (e) => { if (!dead) cb(e.payload); }).then((fn) => {
     if (dead) fn();
     else unlisten = fn;
-  });
+  }).catch(() => {});
   return () => {
     dead = true;
     if (unlisten) unlisten();

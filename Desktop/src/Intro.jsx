@@ -82,21 +82,23 @@ export default function Intro() {
   // 动画进行中持续跟踪推流状态，更新落地颜色
   useEffect(() => {
     if (frozen || !window.hps) return undefined;
+    let alive = true;
     const setState = (state) => {
-      if (!state) return;
+      if (!alive || !state) return;
       cfg.endColor = colorForState(state);
       cfg.endEnergy = state === 'Streaming' ? 0.35 : 0;
     };
     const off = window.hps.onEvent((ev) => {
       if (ev.ev === 'ready' || ev.ev === 'state') setState(ev.state);
     });
-    window.hps.call('state').then((p) => setState(p.state)).catch(() => {});
-    return off;
+    window.hps.call('state').then((p) => setState(p?.state)).catch(() => {});
+    return () => { alive = false; off(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     const el = wrapRef.current;
+    if (!el) return undefined;
     const apply = (f) => {
       el.style.transform = `translate(${f.x - BIG / 2}px, ${f.y - BIG / 2}px) scale(${f.s})`;
       el.style.opacity = String(f.o);

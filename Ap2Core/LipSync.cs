@@ -17,23 +17,26 @@ public static class LipSyncPack
 {
     public const int Port = 17321;
 
+    static readonly byte[] Crx3Prefix = Encoding.ASCII.GetBytes("CRX3 SignedData\0");
+
     public static byte[] BuildCrx(RSA key)
     {
         byte[] zip = ZipExtension();
         byte[] publicKey = key.ExportSubjectPublicKeyInfo();
         byte[] crxId = SHA256.HashData(publicKey).AsSpan(0, 16).ToArray();
         byte[] signedHeader = ProtoBytes(1, crxId);
-        byte[] toSign = new byte[4 + signedHeader.Length + zip.Length];
-        BitConverter.GetBytes(signedHeader.Length).CopyTo(toSign, 0); // 小端长度，只参与签名
-        signedHeader.CopyTo(toSign, 4);
-        zip.CopyTo(toSign, 4 + signedHeader.Length);
+        byte[] toSign = new byte[Crx3Prefix.Length + 4 + signedHeader.Length + zip.Length];
+        Crx3Prefix.CopyTo(toSign, 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(toSign.AsSpan(Crx3Prefix.Length), (uint)signedHeader.Length);
+        signedHeader.CopyTo(toSign, Crx3Prefix.Length + 4);
+        zip.CopyTo(toSign, Crx3Prefix.Length + 4 + signedHeader.Length);
         byte[] signature = key.SignData(toSign, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         byte[] proof = Concat(ProtoBytes(1, publicKey), ProtoBytes(2, signature));
         byte[] header = Concat(ProtoBytes(2, proof), ProtoBytes(10000, signedHeader));
         byte[] file = new byte[12 + header.Length + zip.Length];
         file[0] = (byte)'C'; file[1] = (byte)'r'; file[2] = (byte)'2'; file[3] = (byte)'4';
-        BitConverter.GetBytes(3).CopyTo(file, 4);
-        BitConverter.GetBytes(header.Length).CopyTo(file, 8);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(4), 3);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(8), (uint)header.Length);
         header.CopyTo(file, 12);
         zip.CopyTo(file, 12 + header.Length);
         return file;
@@ -55,9 +58,10 @@ public static class LipSyncPack
     public static bool Verify(byte[] crx)
     {
         if (crx.Length < 12 || crx[0] != 'C' || crx[1] != 'r' || crx[2] != '2' || crx[3] != '4') return false;
-        if (BitConverter.ToInt32(crx, 4) != 3) return false;
-        int headerLen = BitConverter.ToInt32(crx, 8);
-        if (headerLen <= 0 || 12 + headerLen > crx.Length) return false;
+        if (System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(crx.AsSpan(4)) != 3) return false;
+        uint headerLenU = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(crx.AsSpan(8));
+        if (headerLenU == 0 || headerLenU > (uint)(crx.Length - 12)) return false;
+        int headerLen = (int)headerLenU;
         var header = ReadFields(crx.AsSpan(12, headerLen));
         byte[]? proof = Field(header, 2);
         byte[]? signedHeader = Field(header, 10000);
@@ -67,10 +71,11 @@ public static class LipSyncPack
         byte[]? signature = Field(proofFields, 2);
         if (publicKey == null || signature == null) return false;
         int zipAt = 12 + headerLen;
-        byte[] toSign = new byte[4 + signedHeader.Length + (crx.Length - zipAt)];
-        BitConverter.GetBytes(signedHeader.Length).CopyTo(toSign, 0);
-        signedHeader.CopyTo(toSign, 4);
-        crx.AsSpan(zipAt).CopyTo(toSign.AsSpan(4 + signedHeader.Length));
+        byte[] toSign = new byte[Crx3Prefix.Length + 4 + signedHeader.Length + (crx.Length - zipAt)];
+        Crx3Prefix.CopyTo(toSign, 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(toSign.AsSpan(Crx3Prefix.Length), (uint)signedHeader.Length);
+        signedHeader.CopyTo(toSign, Crx3Prefix.Length + 4);
+        crx.AsSpan(zipAt).CopyTo(toSign.AsSpan(Crx3Prefix.Length + 4 + signedHeader.Length));
         using var rsa = RSA.Create();
         rsa.ImportSubjectPublicKeyInfo(publicKey, out _);
         return rsa.VerifyData(toSign, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
@@ -130,6 +135,7 @@ public static class LipSyncPack
     static void Add(ZipArchive zip, string name)
     {
         var entry = zip.CreateEntry(name, CompressionLevel.Optimal);
+        entry.LastWriteTime = new DateTimeOffset(2025, 1, 1, 0, 0, 0, TimeSpan.Zero);
         using var s = entry.Open();
         s.Write(Resource(name));
     }
@@ -213,6 +219,7 @@ public sealed class LipSyncServer : IDisposable
 {
     readonly TcpListener _listener;
     readonly CancellationTokenSource _cts = new();
+    readonly SemaphoreSlim _connGate = new(16, 16);
     readonly RSA _key;
     readonly bool _ownKey;
     readonly byte[] _crx;
@@ -248,8 +255,26 @@ public sealed class LipSyncServer : IDisposable
             TcpClient client;
             try { client = await _listener.AcceptTcpClientAsync(_cts.Token).ConfigureAwait(false); }
             catch { break; }
-            _ = Task.Run(() => Serve(client));
+            if (!_connGate.Wait(0))
+            {
+                try { client.Dispose(); } catch { }
+                continue;
+            }
+            _ = Task.Run(() =>
+            {
+                try { Serve(client); }
+                finally { try { _connGate.Release(); } catch { } }
+            });
         }
+    }
+
+    bool IsAllowedHost(string? host)
+    {
+        if (string.IsNullOrEmpty(host)) return true; // HTTP/1.0 或精简本地客户端
+        return string.Equals(host, "127.0.0.1:" + Port, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(host, "localhost:" + Port, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(host, "127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase);
     }
 
     void Serve(TcpClient client)
@@ -261,13 +286,49 @@ public sealed class LipSyncServer : IDisposable
             stream.WriteTimeout = 3000;
             try
             {
-                var buf = new byte[2048];
-                int n = stream.Read(buf, 0, buf.Length);
-                string head = Encoding.ASCII.GetString(buf, 0, Math.Max(0, n));
-                int line = head.IndexOf('\n');
-                string first = line >= 0 ? head[..line] : head;
-                string[] parts = first.Split(' ');
-                string path = parts.Length >= 2 ? parts[1] : "/";
+                var buf = new byte[4096];
+                int total = 0;
+                int headerEnd = -1;
+                while (total < buf.Length)
+                {
+                    int n = stream.Read(buf, total, buf.Length - total);
+                    if (n <= 0) break;
+                    total += n;
+                    for (int i = Math.Max(0, total - n - 3); i + 3 < total; i++)
+                    {
+                        if (buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10)
+                        {
+                            headerEnd = i;
+                            break;
+                        }
+                    }
+                    if (headerEnd >= 0) break;
+                }
+                if (total == 0) return;
+                string head = Encoding.ASCII.GetString(buf, 0, headerEnd >= 0 ? headerEnd : total);
+                string[] lines = head.Split("\r\n");
+                string[] parts = lines[0].Split(' ');
+                if (parts.Length < 2 || !string.Equals(parts[0], "GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    WriteResponse(stream, 405, "text/plain", Encoding.ASCII.GetBytes("method not allowed"));
+                    return;
+                }
+                string? host = null;
+                for (int i = 1; i < lines.Length; i++)
+                {
+                    int c = lines[i].IndexOf(':');
+                    if (c > 0 && lines[i].AsSpan(0, c).Trim().Equals("Host", StringComparison.OrdinalIgnoreCase))
+                    {
+                        host = lines[i][(c + 1)..].Trim();
+                        break;
+                    }
+                }
+                if (!IsAllowedHost(host))
+                {
+                    WriteResponse(stream, 403, "text/plain", Encoding.ASCII.GetBytes("forbidden"));
+                    return;
+                }
+                string path = parts[1];
                 int q = path.IndexOf('?');
                 if (q >= 0) path = path[..q];
                 byte[] body;
@@ -309,11 +370,10 @@ public sealed class LipSyncServer : IDisposable
 
     static void WriteResponse(NetworkStream stream, int status, string type, byte[] body)
     {
-        string reason = status == 200 ? "OK" : "Not Found";
+        string reason = status switch { 200 => "OK", 403 => "Forbidden", 405 => "Method Not Allowed", _ => "Not Found" };
         string head = "HTTP/1.1 " + status + " " + reason + "\r\n" +
                       "Content-Type: " + type + "\r\n" +
                       "Content-Length: " + body.Length + "\r\n" +
-                      "Access-Control-Allow-Origin: *\r\n" +
                       "Cache-Control: no-store\r\n" +
                       "Connection: close\r\n\r\n";
         byte[] prefix = Encoding.ASCII.GetBytes(head);
@@ -326,6 +386,7 @@ public sealed class LipSyncServer : IDisposable
         try { _cts.Cancel(); } catch { }
         try { _listener.Stop(); } catch { }
         _cts.Dispose();
+        _connGate.Dispose();
         if (_ownKey) _key.Dispose();
     }
 }

@@ -137,6 +137,7 @@ html[data-browser-preview] body {
 @keyframes drift-b { from { transform: translate(0, 0); } to { transform: translate(-14px, 12px); } }
 @keyframes drift-c { from { transform: translate(0, 0); } to { transform: translate(10px, -14px); } }
 .still .bd, .still .row, .still .card { animation: none !important; transition: none !important; }
+.phase-standby .bd, .phase-standby .orb-ring { animation-play-state: paused; }
 
 /* ======================= 玻璃卡片 ======================= */
 .card { position: absolute; z-index: 1; }
@@ -485,7 +486,8 @@ button.row.on:hover { background: rgba(44, 42, 26, 0.38); }
 }
 .orb-btn:hover:not(:disabled) { transform: scale(1.05); }
 .orb-btn:active:not(:disabled) { transform: scale(0.95); }
-.orb-btn:focus-visible { outline: none; }
+.orb-btn:focus-visible { outline: none; box-shadow: 0 0 0 2.5px rgba(255, 255, 255, 0.78); }
+.ladder:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.72); outline-offset: 4px; border-radius: 8px; }
 .orb { position: absolute; inset: 0; pointer-events: none; }
 .orb-glyph {
   position: relative;

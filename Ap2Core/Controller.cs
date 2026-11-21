@@ -53,9 +53,9 @@ public sealed class HomePodController : IDisposable
     IAudioSource? _source;
     PcmBus? _bus;
     CancellationTokenSource? _reconnectCts;
-    bool _wantConnected;
+    volatile bool _wantConnected;
     Timer? _volumeTimer;
-    bool _disposed;
+    volatile bool _disposed;
 
     public ControllerSettings Settings { get; }
     public StreamState State { get; private set; } = StreamState.Disconnected;
@@ -128,7 +128,9 @@ public sealed class HomePodController : IDisposable
             {
                 try
                 {
+                    if (!session.IsConnected) throw new IOException("连接已提前断开");
                     await session.SetVolumeDbAsync(Ap2Session.PercentToDb(Settings.VolumePercent)).ConfigureAwait(false);
+                    if (!session.IsConnected) throw new IOException("连接已提前断开");
                     ready.Add(new Live { Ip = ip, Session = session });
                 }
                 catch (Exception e)
@@ -139,8 +141,8 @@ public sealed class HomePodController : IDisposable
                 }
             }
             var branches = ready.Select(_ => new BusSource(_bus!)).ToList();
-            for (int i = 0; i < ready.Count; i++) ready[i].Session.StartStreaming(branches[i]);
             lock (_stateLock) _live.AddRange(ready);
+            for (int i = 0; i < ready.Count; i++) ready[i].Session.StartStreaming(branches[i]);
 
             if (ready.Count == 0)
             {
@@ -282,7 +284,11 @@ public sealed class HomePodController : IDisposable
             }
             else StartReconnectOne(ip!);
         }
-        else if (!anyLeft) SetState(StreamState.Disconnected, "连接已断开：" + why);
+        else if (!anyLeft)
+        {
+            DropSource();
+            SetState(StreamState.Disconnected, "连接已断开：" + why);
+        }
         else SetState(StreamState.Streaming, PlayingStatus(Settings.Targets().Count));
     }
 
@@ -339,10 +345,10 @@ public sealed class HomePodController : IDisposable
                 }
                 born = opened.Session;
                 await born.SetVolumeDbAsync(Ap2Session.PercentToDb(Settings.VolumePercent)).ConfigureAwait(false);
-                if (ct.IsCancellationRequested || _bus != bus) { born.Dispose(); return; }
+                if (ct.IsCancellationRequested || _bus != bus || !born.IsConnected) { born.Dispose(); return; }
                 var branch = new BusSource(bus);
-                born.StartStreaming(branch);
                 lock (_stateLock) _live.Add(new Live { Ip = ip, Session = born });
+                born.StartStreaming(branch);
                 born = null;
                 SetState(StreamState.Streaming, PlayingStatus(Settings.Targets().Count));
                 return;
@@ -359,9 +365,18 @@ public sealed class HomePodController : IDisposable
     {
         pct = Math.Clamp(pct, 0, 100);
         Settings.VolumePercent = pct;
-        if (_disposed) return;
-        var t = _volumeTimer ??= new Timer(async _ => await ApplyVolumeAsync().ConfigureAwait(false));
-        t.Change(120, Timeout.Infinite);
+        lock (_stateLock)
+        {
+            if (_disposed) return;
+            _volumeTimer ??= new Timer(_ => _ = ApplyVolumeSafeAsync());
+            try { _volumeTimer.Change(120, Timeout.Infinite); } catch (ObjectDisposedException) { }
+        }
+    }
+
+    async Task ApplyVolumeSafeAsync()
+    {
+        try { await ApplyVolumeAsync().ConfigureAwait(false); }
+        catch (Exception e) { Log("设置音量异常: " + e.Message); }
     }
 
     async Task ApplyVolumeAsync()
@@ -390,9 +405,16 @@ public sealed class HomePodController : IDisposable
         _disposed = true;
         _wantConnected = false;
         CancelReconnect();
-        _volumeTimer?.Dispose();
+        Timer? vt;
         List<Live> copy;
-        lock (_stateLock) { copy = _live.ToList(); _live.Clear(); }
+        lock (_stateLock)
+        {
+            vt = _volumeTimer;
+            _volumeTimer = null;
+            copy = _live.ToList();
+            _live.Clear();
+        }
+        try { vt?.Dispose(); } catch { }
         foreach (var l in copy) { try { l.Session.StopAsync().Wait(3000); } catch { } }
         DropSource();
     }

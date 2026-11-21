@@ -123,57 +123,113 @@ public static class Bplist
     public static object? Decode(byte[] buf)
     {
         if (!IsBplist(buf)) throw new FormatException("不是 bplist");
-        var t = buf.AsSpan(buf.Length - 32);
+        const int MaxObjects = 65536;
+        int bodyEnd = buf.Length - 32;
+        var t = buf.AsSpan(bodyEnd);
         int offSize = t[6], refSize = t[7];
-        long numObjs = (long)BinaryPrimitives.ReadUInt64BigEndian(t.Slice(8));
-        long top = (long)BinaryPrimitives.ReadUInt64BigEndian(t.Slice(16));
-        long offTable = (long)BinaryPrimitives.ReadUInt64BigEndian(t.Slice(24));
+        if (offSize is < 1 or > 8 || refSize is < 1 or > 8)
+            throw new FormatException("bplist 宽度无效");
+        ulong numObjsU = BinaryPrimitives.ReadUInt64BigEndian(t.Slice(8));
+        ulong topU = BinaryPrimitives.ReadUInt64BigEndian(t.Slice(16));
+        ulong offTableU = BinaryPrimitives.ReadUInt64BigEndian(t.Slice(24));
+        if (numObjsU == 0 || numObjsU > MaxObjects || topU >= numObjsU)
+            throw new FormatException("bplist 对象数无效");
+        long numObjs = (long)numObjsU;
+        long top = (long)topU;
+        if (offTableU < 8 || offTableU > (ulong)bodyEnd || (ulong)numObjs * (ulong)offSize > (ulong)bodyEnd - offTableU)
+            throw new FormatException("bplist 偏移表越界");
+        long offTable = (long)offTableU;
 
-        ulong Rd(long off, int n) { ulong v = 0; for (int i = 0; i < n; i++) v = (v << 8) | buf[off + i]; return v; }
+        ulong Rd(long off, int n)
+        {
+            if (n < 1 || n > 8 || off < 0 || off > buf.Length - n)
+                throw new FormatException("bplist 读取越界");
+            ulong v = 0;
+            for (int i = 0; i < n; i++) v = (v << 8) | buf[off + i];
+            return v;
+        }
         var offsets = new long[numObjs];
-        for (long i = 0; i < numObjs; i++) offsets[i] = (long)Rd(offTable + i * offSize, offSize);
+        for (long i = 0; i < numObjs; i++)
+        {
+            ulong o = Rd(offTable + i * offSize, offSize);
+            if (o < 8 || o >= (ulong)offTable) throw new FormatException("bplist 对象偏移越界");
+            offsets[i] = (long)o;
+        }
 
         object? ReadObj(long idx, int depth)
         {
             if (depth > 32) throw new FormatException("bplist 嵌套过深");
+            if (idx < 0 || idx >= numObjs) throw new FormatException("bplist 对象索引越界");
             long p = offsets[idx];
+            if (p >= offTable) throw new FormatException("bplist 对象越界");
             byte m = buf[p++];
             int hi = m >> 4, lo = m & 15;
-            (long n, long q) Len()
+            (int n, int q) Len()
             {
-                if (lo != 15) return (lo, p);
-                int w = 1 << (buf[p] & 15);
-                return ((long)Rd(p + 1, w), p + 1 + w);
+                if (lo != 15) return (lo, (int)p);
+                if (p >= offTable) throw new FormatException("bplist 长度标记越界");
+                byte lm = buf[p];
+                if ((lm >> 4) != 1 || (lm & 15) > 3) throw new FormatException("bplist 长度类型无效");
+                int w = 1 << (lm & 15);
+                ulong lenU = Rd(p + 1, w);
+                if (lenU > (ulong)offTable) throw new FormatException("bplist 长度越界");
+                return ((int)lenU, (int)(p + 1 + w));
             }
             switch (hi)
             {
                 case 0x0: return lo == 8 ? false : lo == 9 ? true : null;
                 case 0x1:
                 {
+                    if (lo > 3) throw new FormatException("bplist 整数宽度不支持");
                     int n = 1 << lo;
-                    ulong v = Rd(p, n);
-                    return n == 8 ? (long)v : (long)v;
+                    return (long)Rd(p, n);
                 }
-                case 0x2: return lo == 2 ? BinaryPrimitives.ReadSingleBigEndian(buf.AsSpan((int)p)) : BinaryPrimitives.ReadDoubleBigEndian(buf.AsSpan((int)p));
-                case 0x3: return new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(BinaryPrimitives.ReadDoubleBigEndian(buf.AsSpan((int)p)));
-                case 0x4: { var (n, q) = Len(); return buf.AsSpan((int)q, (int)n).ToArray(); }
-                case 0x5: { var (n, q) = Len(); return Encoding.Latin1.GetString(buf, (int)q, (int)n); }
-                case 0x6: { var (n, q) = Len(); return Encoding.BigEndianUnicode.GetString(buf, (int)q, (int)n * 2); }
+                case 0x2:
+                {
+                    int n = lo == 2 ? 4 : lo == 3 ? 8 : throw new FormatException("bplist 浮点宽度不支持");
+                    if (p + n > offTable) throw new FormatException("bplist 浮点越界");
+                    return lo == 2 ? BinaryPrimitives.ReadSingleBigEndian(buf.AsSpan((int)p, 4)) : BinaryPrimitives.ReadDoubleBigEndian(buf.AsSpan((int)p, 8));
+                }
+                case 0x3:
+                {
+                    if (p + 8 > offTable) throw new FormatException("bplist 日期越界");
+                    return new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(BinaryPrimitives.ReadDoubleBigEndian(buf.AsSpan((int)p, 8)));
+                }
+                case 0x4:
+                {
+                    var (n, q) = Len();
+                    if (q > offTable - n) throw new FormatException("bplist 数据越界");
+                    return buf.AsSpan(q, n).ToArray();
+                }
+                case 0x5:
+                {
+                    var (n, q) = Len();
+                    if (q > offTable - n) throw new FormatException("bplist ASCII 越界");
+                    return Encoding.Latin1.GetString(buf, q, n);
+                }
+                case 0x6:
+                {
+                    var (n, q) = Len();
+                    if (n > (offTable - q) / 2) throw new FormatException("bplist UTF-16 越界");
+                    return Encoding.BigEndianUnicode.GetString(buf, q, n * 2);
+                }
                 case 0xA:
                 {
                     var (n, q) = Len();
-                    var a = new List<object>();
-                    for (long i = 0; i < n; i++) a.Add(ReadObj((long)Rd(q + i * refSize, refSize), depth + 1)!);
+                    if ((long)n * refSize > offTable - q) throw new FormatException("bplist 数组越界");
+                    var a = new List<object>(n);
+                    for (int i = 0; i < n; i++) a.Add(ReadObj((long)Rd(q + (long)i * refSize, refSize), depth + 1)!);
                     return a;
                 }
                 case 0xD:
                 {
                     var (n, q) = Len();
+                    if ((long)n * 2 * refSize > offTable - q) throw new FormatException("bplist 字典越界");
                     var d = new PDict();
-                    for (long i = 0; i < n; i++)
+                    for (int i = 0; i < n; i++)
                     {
-                        var k = ReadObj((long)Rd(q + i * refSize, refSize), depth + 1) as string ?? "";
-                        var v = ReadObj((long)Rd(q + (n + i) * refSize, refSize), depth + 1);
+                        var k = ReadObj((long)Rd(q + (long)i * refSize, refSize), depth + 1) as string ?? "";
+                        var v = ReadObj((long)Rd(q + (long)(n + i) * refSize, refSize), depth + 1);
                         d.Add(k, v!);
                     }
                     return d;
