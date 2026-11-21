@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (Windows x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: Desktop/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'Desktop/src-tauri -> target'
+
+      - name: Build .NET projects (Debug)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet build Sidecar/HomePodSidecar.csproj -c Debug
+          dotnet build Ap2Cli/Ap2Cli.csproj -c Debug
+
+      - name: Run Ap2Cli core tests
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $cli = "Ap2Cli/bin/Debug/net8.0-windows/Ap2Cli.dll"
+          dotnet $cli selftest
+          dotnet $cli resample-test
+          dotnet $cli e2e-test
+          dotnet $cli controller-test
+
+      - name: Validate LipSync extension & scripts
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          node --check Desktop/lipsync/extension/sw.js
+          node --check Desktop/lipsync/extension/bridge.js
+          node --check Desktop/lipsync/extension/main.js
+          node -e "JSON.parse(require('fs').readFileSync('Desktop/lipsync/extension/manifest.json', 'utf8'))"
+          node Desktop/scripts/selection-check.mjs
+
+      - name: Install frontend dependencies & build
+        working-directory: Desktop
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm run build
+          npm run sidecar
+
+      - name: Check Tauri Rust backend
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo check --manifest-path Desktop/src-tauri/Cargo.toml
+          cargo check --manifest-path Desktop/src-tauri/Cargo.toml --release

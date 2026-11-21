@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2.0.2; leave empty to use version in tauri.conf.json)'
+        required: false
+        default: ''
+      draft:
+        description: 'Create as draft release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Windows Release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: Desktop/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'Desktop/src-tauri -> target'
+
+      - name: Resolve version & sync manifests
+        id: meta
+        run: |
+          $confPath = "Desktop/src-tauri/tauri.conf.json"
+          $conf = Get-Content $confPath -Raw | ConvertFrom-Json
+
+          if ("${{ github.event_name }}" -eq "push") {
+            $tag = "${{ github.ref_name }}"
+          } elseif ("${{ inputs.tag }}" -ne "") {
+            $tag = "${{ inputs.tag }}"
+          } else {
+            $tag = "v$($conf.version)"
+          }
+
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "Invalid release tag format: $tag (expected vX.Y.Z or vX.Y.Z-prerelease)"
+          }
+          $ver = $tag.Substring(1)
+          $prerelease = if ($ver -match '-') { "true" } else { "false" }
+
+          # Keep build manifests aligned with the release tag
+          if ($conf.version -ne $ver) {
+            Write-Host "Syncing version $($conf.version) -> $ver for release build"
+            $conf.version = $ver
+            $conf | ConvertTo-Json -Depth 10 | Set-Content -Path $confPath -Encoding UTF8
+
+            $pkgPath = "Desktop/package.json"
+            $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
+            $pkg.version = $ver
+            $pkg | ConvertTo-Json -Depth 10 | Set-Content -Path $pkgPath -Encoding UTF8
+
+            $cargoPath = "Desktop/src-tauri/Cargo.toml"
+            $cargo = Get-Content $cargoPath -Raw
+            $cargo = [regex]::Replace($cargo, '(?m)^version\s*=\s*"[^"]+"', "version = `"$ver`"", 1)
+            Set-Content -Path $cargoPath -Value $cargo -Encoding UTF8 -NoNewline
+          }
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "prerelease=$prerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Run verification tests before packaging
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet build Sidecar/HomePodSidecar.csproj -c Debug
+          dotnet build Ap2Cli/Ap2Cli.csproj -c Debug
+          $cli = "Ap2Cli/bin/Debug/net8.0-windows/Ap2Cli.dll"
+          dotnet $cli selftest
+          dotnet $cli resample-test
+          dotnet $cli e2e-test
+          dotnet $cli controller-test
+          node --check Desktop/lipsync/extension/sw.js
+          node --check Desktop/lipsync/extension/bridge.js
+          node --check Desktop/lipsync/extension/main.js
+          node Desktop/scripts/selection-check.mjs
+
+      - name: Build Tauri release & NSIS installer
+        working-directory: Desktop
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm run pack
+
+      - name: Assemble portable zip & SHA256SUMS.txt
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $distDir = "release-assets"
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+
+          $nsisDir = "Desktop/src-tauri/target/release/bundle/nsis"
+          $setupSrc = Get-ChildItem -Path $nsisDir -Filter "*_x64-setup.exe" | Select-Object -First 1
+          if (-not $setupSrc) {
+            throw "NSIS installer not found in $nsisDir"
+          }
+          $setupName = "HomePodSender_${env:VERSION}_x64-setup.exe"
+          $setupDst = Join-Path $distDir $setupName
+          Copy-Item -Path $setupSrc.FullName -Destination $setupDst -Force
+
+          # Portable zip layout: HomePodSender/HomePodSender.exe + HomePodSender/sidecar/HomePodSidecar.exe
+          $stageRoot = "portable-stage"
+          $appDir = Join-Path $stageRoot "HomePodSender"
+          $sidecarDir = Join-Path $appDir "sidecar"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stageRoot
+          New-Item -ItemType Directory -Force -Path $sidecarDir | Out-Null
+          Copy-Item "Desktop/src-tauri/target/release/HomePodSender.exe" -Destination $appDir -Force
+          Copy-Item "Desktop/sidecar-publish/HomePodSidecar.exe" -Destination $sidecarDir -Force
+
+          $zipName = "HomePodSender_${env:VERSION}_x64-portable.zip"
+          $zipDst = Join-Path $distDir $zipName
+          Compress-Archive -Path $appDir -DestinationPath $zipDst -Force
+
+          $sums = @(
+            "$((Get-FileHash $setupDst -Algorithm SHA256).Hash)  $setupName"
+            "$((Get-FileHash $zipDst -Algorithm SHA256).Hash)  $zipName"
+          )
+          $sumsPath = Join-Path $distDir "SHA256SUMS.txt"
+          $sums -join "`r`n" | Set-Content -Path $sumsPath -Encoding UTF8
+          Get-Content $sumsPath
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          IS_DRAFT: ${{ inputs.draft }}
+        run: |
+          $files = @(
+            "release-assets/HomePodSender_${{ steps.meta.outputs.version }}_x64-setup.exe",
+            "release-assets/HomePodSender_${{ steps.meta.outputs.version }}_x64-portable.zip",
+            "release-assets/SHA256SUMS.txt"
+          )
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $env:TAG 2>$null | Out-Null
+          $exists = ($LASTEXITCODE -eq 0)
+
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($exists) {
+            gh release upload $env:TAG @files --clobber
+          } else {
+            $ghArgs = @(
+              "release", "create", $env:TAG,
+              "--target", "${{ github.sha }}",
+              "--title", "HomePodSender $env:TAG",
+              "--generate-notes"
+            )
+            if ($env:PRERELEASE -eq "true") { $ghArgs += "--prerelease" }
+            if ($env:IS_DRAFT -eq "true") { $ghArgs += "--draft" }
+            $ghArgs += $files
+            & gh @ghArgs
+          }
