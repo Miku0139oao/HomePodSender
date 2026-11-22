@@ -1,191 +1,184 @@
 # HomePod 推流
 
-把电脑正在播放的声音，实时推送到 HomePod（AirPlay 2）。用来替代在 HomePod 系统 27.0 上已经出不了声的 TuneBlade。
+將電腦正在播放的聲音，透過 AirPlay 2 即時推送到 HomePod，用來替代在 HomePod 系統 27.0 上已無法出聲的 TuneBlade。
 
-界面复刻参考图里的**磨砂玻璃小组件**：三张半透明玻璃卡片叠在柔焦背景上，配点阵大字、胶囊勾选行和彩虹渐变。
-程序常驻在**任务栏右下角**：启动时屏幕中央浮现一团 **Siri 光团**，它沿弧线飞到右下角，面板再从光团所在位置绽开。
-托盘图标也是这颗光球：未播放时是透明白色球体，推流时变成随音量滚动的彩色光团。应用图标（开始菜单、安装包）同样是这团光。
+介面採用**毛玻璃小工具**風格：三張半透明玻璃卡片疊在柔焦背景上，搭配點陣大字、膠囊勾選列與彩虹漸層。
+程式常駐於**工作列右下角**：啟動時螢幕中央浮現一團 **Siri 光團**，沿弧線飛往右下角，面板再從光團所在位置綻開。
+系統匣圖示也是這顆光球：未播放時為透明白色球體，推流時會變成隨音量起伏流動的彩色光團；開始功能表與安裝程式的應用程式圖示同樣採用這顆光球。
 
-前端是 **Tauri 2 + React 19 + Vite 7**；Rust 外壳负责窗口、托盘、单实例与 sidecar 进程。AirPlay 协议、WASAPI 回环抓取与重采样仍由原来的 C#（`Ap2Core`）负责，通过 `Sidecar` 进程以 NDJSON over stdio 暴露给界面，协议和音频链路没有重写。
+前端使用 **Tauri 2 + React 19 + Vite 7**；Rust 外殼負責視窗、系統匣、單實例與 sidecar 行程管理。AirPlay 2 協定、WASAPI 回環擷取與重取樣由 C#（`Ap2Core`）實作，並透過 `Sidecar` 行程以 NDJSON over stdio 與介面通訊。
 
-> **下载**：[Releases](https://github.com/Miku0139oao/HomePodSender/releases) —— 安装包（当前用户，无需管理员）或免安装 zip。
-> 需要 Windows 10/11 x64、WebView2 运行时和 .NET 8 桌面运行时；从源码构建见下文。
+> **下載**：[Releases](https://github.com/Miku0139oao/HomePodSender/releases) —— 提供安裝程式（僅安裝給目前使用者，無需系統管理員權限）或免安裝版 zip。
+> 需要 Windows 10/11 x64、WebView2 執行環境與 .NET 8 桌面執行環境；從原始碼建置請見下方說明。
 
 | 未播放 | 推流中 |
 |---|---|
 | ![](shots/idle.png) | ![](shots/streaming.png) |
 
-| 连接中 | 设置（卡片翻面） |
+| 連線中 | 設定（卡片翻面） |
 |---|---|
 | ![](shots/connecting.png) | ![](shots/settings.png) |
 
-| 音频来源（可选择声卡） |
+| 音訊來源（可選擇音效卡） |
 |---|
 | ![](shots/audio-picker.png) |
 
-| 关闭背景卡片（三张卡各自悬浮） |
+| 關閉背景卡片（三張卡片各自懸浮） |
 |---|
 | ![](shots/no-board.png) |
 
-| 启动动画：浮现 | 停顿 | 飞向右下角 |
+| 啟動動畫：浮現 | 停頓 | 飛向右下角 |
 |---|---|---|
 | ![](shots/intro-appear.png) | ![](shots/intro-hold.png) | ![](shots/intro-fly.png) |
 
-## 怎么用
+## 使用方式
 
-1. 从 [Releases](https://github.com/Miku0139oao/HomePodSender/releases) 下 `HomePodSender_*_x64-setup.exe` 安装（当前用户，无需管理员），或解压免安装 zip 后直接运行 `HomePodSender\HomePodSender.exe`（需保留旁边的 `sidecar\HomePodSidecar.exe`）。
-2. 从开始菜单启动 HomePodSender。屏幕中央先出现光团，约 2 秒后飞到右下角，面板在任务栏上方展开。
-3. **左边高卡（AirPlay）**：点设备行选择要推流的 HomePod；「扫描设备」搜索局域网，「IP」手动添加。
-4. **右上卡（光球）**：轻点光球开始推流，再点一下断开。卡片下方显示设备名和推流时长。
-5. **右下卡（音量）**：点或拖动点阵调 **HomePod 的音量**，鼠标滚轮每格 ±2%，左边喇叭键一键静音 / 恢复。
-6. 设置面右上角可切换 **繁體中文 / English**；设置会保存在本机。
-7. 点面板以外的地方或按 Esc，面板收回；**左键点托盘光球**可以再次打开或收起。右键托盘图标可连接、断开、打开日志文件夹或退出。
-8. 再次从开始菜单启动程序，不会开第二个实例，只会把面板唤出来。
+1. 從 [Releases](https://github.com/Miku0139oao/HomePodSender/releases) 下載 `HomePodSender_*_x64-setup.exe` 安裝（無需管理員權限），或解壓縮免安裝 zip 後直接執行 `HomePodSender\HomePodSender.exe`（需保留同目錄下的 `sidecar\HomePodSidecar.exe`）。
+2. 從開始功能表啟動 HomePodSender。螢幕中央會先浮現光團，約 2 秒後飛往右下角，面板於工作列上方展開。
+3. **左側高卡（AirPlay）**：點選裝置列選擇要推流的 HomePod；按「掃描裝置」搜尋區域網路，或按「IP」手動新增。
+4. **右上卡（光球）**：輕點光球開始推流，再點一次中斷連線；卡片下方會顯示裝置名稱與推流時間。
+5. **右下卡（音量）**：點擊或拖曳點陣調整 **HomePod 音量**，滑鼠滾輪每格 ±2%，左側喇叭鍵可一鍵靜音 / 恢復。
+6. 設定頁右上角可切換 **繁體中文 / English**，偏好設定會儲存在本機。
+7. 點擊面板以外區域或按 `Esc` 可收合面板；**左鍵點擊系統匣光球**可再次開啟或收合，右鍵可連線、中斷連線、開啟日誌資料夾或結束程式。
+8. 再次從開始功能表啟動程式時，不會開啟第二個實例，而是直接喚出面板。
 
-> Windows 11 默认把新程序的托盘图标收进任务栏的「^」溢出区。想让光球一直显示在任务栏上：
-> 设置 → 个性化 → 任务栏 → 其他系统托盘图标 → 打开 HomePodSender。
+> Windows 11 預設會將新程式的系統匣圖示收進工作列的「^」溢位區。若想讓光球常駐顯示在工作列上：
+> 設定 → 個人化 → 工作列 → 其他系統匣圖示 → 開啟 HomePodSender。
 
-需要 Windows 10/11 x64、WebView2 运行时（Windows 11 自带，Win10 一般也已安装）和 .NET 8 桌面运行时（sidecar 使用）。
+系統需求：Windows 10/11 x64、WebView2 執行環境（Windows 11 已內建，Windows 10 多數亦已安裝）以及 .NET 8 桌面執行環境（供 sidecar 使用）。
 
-## 立体声对（两台 HomePod 一起出声）
+## 立體聲對（兩台 HomePod 同時出聲）
 
-如果你的两台 HomePod 在家庭（Home）App 中组成了**立体声对**，正常时只需要连接**组长**，HomePod 自己会把左右声道分给两台。
-不需要、也不应该同时连两台，也不要直连成员。设备列表里标出「组长 / 成员」，点到成员时程序会自动改连组长。
+若你的兩台 HomePod 已在 Apple「家庭（Home）」App 中組成**立體聲對**，正常情況下只需連線**組長**，HomePod 會自行將左右聲道分配給兩台喇叭。
+不需要、也不應該同時連線兩台，更不要直連成員。裝置清單會標示「組長 / 成員」，點選成員時程式會自動改連組長。
 
-每次选择设备、点光球连接、启动时自动连接之前，以及运行期间每 30 秒，程序都会现场读一次两台的 `/info`（只读，不出声），按 HomePod 当前的报告判断是否成对。
-如果两台都报告自己是组长，说明此刻**没有建立起立体声分组**：列表里两台都显示「组长」，播放卡片显示「未组立体声对」（推流时显示「仅此一台」）。
-实测直连成员那台会让分组散掉（两台又都报告组长）。所以程序只在**确认成对**时把成员改连组长；
-两台都自称组长（未成对）时按你点的设备连接，并提示「未组立体声对」，方便单独使用那一台。程序不会替它们猜谁是组长。
+每次選擇裝置、點光球連線、啟動自動連線前，以及執行期間每 30 秒，程式都會即時讀取兩台的 `/info`（唯讀，不會出聲），依 HomePod 當下的回報判斷是否已成對。
+如果兩台都回報自己是組長，代表此刻**並未建立立體聲群組**：清單中兩台都會顯示「組長」，播放卡片會提示「未組成同一組立體聲對」（推流時顯示「僅此一台」）。
+實測直連成員會導致群組分散（兩台皆回報組長），因此程式僅在**確認成對**時將成員改連組長；
+兩台都自稱組長（未成對）時會依你點選的裝置連線並給出提示，不會替它們猜測誰是組長。
 
-修复要在 Home（家庭）App 里做，程序无法代劳：确认两台是否仍在同一个立体声对里；已经拆开就重新创建；还在的话，可以先给成员那台断电重插，
-等一两分钟再用 `probe --txt` 看它是否重新报告为成员（带 `pgid`）。
+立體聲群組的修復需在「家庭（Home）」App 內處理，程式無法代勞：確認兩台是否仍在同一組立體聲對中；若已拆散請重新建立；若仍在群組內，可先將成員斷電重插，等一兩分鐘後再用 `probe --txt` 檢查是否重新回報為成員（帶 `pgid`）。
 
-## 设置（左卡右上角齿轮，卡片翻到背面）
+## 設定（左卡右上角齒輪，卡片翻至背面）
 
-| 项 | 说明 |
+| 項目 | 說明 |
 |---|---|
-| 音频 | 跟随 Windows 默认播放设备，或固定抓取指定播放端点（声卡 / 虚拟声卡）。播放中切换会自动重连 |
-| 断线自动重连 | 网络闪断或 HomePod 重启后自动重连 |
-| 启动时自动连接 | 默认关闭，避免一开机就出声 |
-| 播放延迟 | 点一下在 0 / 0.1 / 0.25 / 0.5 / 1 / 1.5 / 2 秒间切换。越低越跟手，也越容易受网络抖动影响；0 秒为实验值。下次连接生效 |
-| 对齐画面 | 配合内置的 Chrome 扩展，仅推迟网页画面以对齐 HomePod 播放延迟（声音仍即时送出） |
-| 背景卡片 | 默认开启：三张卡片衬在一块圆角背景卡片上。关掉后背景卡片消失，三张卡片各自悬浮在桌面上（磨砂质感保留） |
+| 音訊 | 跟隨 Windows 預設播放裝置，或固定擷取指定的播放端點（音效卡 / 虛擬音效卡）。播放中切換會自動重新連線 |
+| 斷線自動重連 | 網路閃斷或 HomePod 重新啟動後自動嘗試重新連線 |
+| 啟動時自動連線 | 預設關閉，避免一開啟程式就突然出聲 |
+| 播放延遲 | 點一下在 0 / 0.1 / 0.25 / 0.5 / 1 / 1.5 / 2 秒間循環切換。延遲越低越跟手，但也越容易受網路抖動影響；0 秒為實驗值，下次連線生效 |
+| 對齊畫面 | 搭配內建的 Chrome 擴充功能，僅延後網頁畫面以對齊 HomePod 播放延遲（聲音仍即時送出） |
+| 背景卡片 | 預設開啟：三張卡片襯在一塊圓角背景卡片上；關閉後三張卡片各自懸浮於桌面（保留毛玻璃質感） |
 
-左上角的返回键翻回设备列表。
+點擊左上角的返回鍵即可翻回裝置清單。
 
-## 安全默认值
+## 安全預設值
 
-- 不会自动连接、不会自动出声；首次默认音量 20%。
-- 连接时先把音量设好，再开始推流，不会以 HomePod 上次的音量突然出声。
-- 配置与日志在 `%APPDATA%\HomePodSender\`（`config.json`、`log.txt`）。
+- 預設不自動連線、不自動出聲；首次啟動預設音量為 20%。
+- 連線時會先設定好音量再開始推流，避免以 HomePod 上次的音量突然大聲播放。
+- 組態檔與日誌儲存在 `%APPDATA%\HomePodSender\`（`config.json`、`log.txt`）。
 
-## 技术结构
+## 技術架構
 
-| 路径 | 说明 |
+| 路徑 | 說明 |
 |---|---|
-| `Desktop\src\Panel.jsx` | 右下角面板：三张玻璃卡、设备 / 设置翻面、音量点阵、开合动画 |
-| `Desktop\src\Intro.jsx` | 启动动画（全屏透明、鼠标穿透窗口）：光团浮现 → 停顿 → 弧线飞到面板光球位置 |
-| `Desktop\src\Orb.jsx` | Siri 光团 WebGL 着色器：彩色光团（推流）/ 透明白球（未播放）连续过渡，亮度和旋转跟随实时电平 |
-| `Desktop\src\DotText.jsx` | 5×7 点阵字（SVG 圆点，不依赖外部字体） |
-| `Desktop\src\layout.js` | 面板几何（与 Rust 常量一致）和截图预览参数 |
-| `Desktop\src-tauri\src\main.rs` | Tauri 外壳：面板 / 启动动画两个透明窗口、托盘、单实例、sidecar 与 NDJSON 桥 |
-| `Desktop\src-tauri\src\orb.rs` | 托盘光球：与着色器同一套公式，在 CPU 上逐帧绘制，窗口隐藏时也能动 |
-| `Desktop\lipsync\extension\` | Chrome 画面对齐扩展（隔离世界运行，不向页面主世界注入脚本） |
-| `Desktop\scripts\` | 开发脚本：端到端测试、WebView2 截图、桌面连拍、托盘实拍 |
-| `Desktop\src-tauri\target\release\bundle\nsis\` | 打包好的安装程序 |
-| `Sidecar\` | C# 宿主进程：stdin/stdout NDJSON，把 `Ap2Core` 暴露给界面 |
-| `Ap2Core\` | AirPlay 协议、音频、连接控制器、画面对齐服务（与界面无关） |
-| `Ap2Cli\` | 命令行工具与测试（含本机“假 HomePod”） |
-| `design-ref\` | 参考设计图与对比、托盘图标预览脚本 |
-| `shots\` | 界面截图（面板 2x，透明底） |
+| `Desktop\src\Panel.jsx` | 右下角面板：三張玻璃卡、裝置 / 設定翻面、音量點陣、開合動畫 |
+| `Desktop\src\Intro.jsx` | 啟動動畫（全螢幕透明、滑鼠穿透視窗）：光團浮現 → 停頓 → 弧線飛往面板光球位置 |
+| `Desktop\src\Orb.jsx` | Siri 光團 WebGL 著色器：彩色光團（推流）/ 透明白球（未播放）連續過渡，亮度與旋轉跟隨即時電平 |
+| `Desktop\src\DotText.jsx` | 5×7 點陣字（SVG 圓點，不依賴外部字型） |
+| `Desktop\src\layout.js` | 面板幾何參數（與 Rust 常數一致）與截圖預覽參數 |
+| `Desktop\src-tauri\src\main.rs` | Tauri 外殼：面板 / 啟動動畫兩個透明視窗、系統匣、單實例、sidecar 與 NDJSON 橋接 |
+| `Desktop\src-tauri\src\orb.rs` | 系統匣光球：與著色器同一套公式，在 CPU 上逐幀繪製，視窗隱藏時仍可動態顯示 |
+| `Desktop\lipsync\extension\` | Chrome 畫面對齊擴充功能（隔離世界執行，不向網頁主世界注入腳本） |
+| `Desktop\scripts\` | 開發與測試腳本：端對端測試、WebView2 截圖、桌面連拍、系統匣實拍 |
+| `Desktop\src-tauri\target\release\bundle\nsis\` | 打包完成的 NSIS 安裝程式 |
+| `Sidecar\` | C# 宿主行程：透過 stdin/stdout NDJSON 將 `Ap2Core` 暴露給介面 |
+| `Ap2Core\` | AirPlay 2 協定、音訊、連線控制器與畫面對齊服務（與介面無關） |
+| `Ap2Cli\` | 命令列診斷工具與測試（含本機「假 HomePod」） |
+| `design-ref\` | 參考設計對比與圖示產生腳本 |
+| `shots\` | 介面截圖（面板 2x，透明底） |
 
-## 实现要点
+## 實作要點
 
-- 玻璃：`backdrop-filter: blur() saturate() brightness()` 加多层内描边高光和渐变描边；面板自带一层柔焦背景（几团径向渐变加颗粒），桌面是什么颜色都有东西可“透”。
-- Siri 光团：五团彩光（品红 / 蓝 / 紫 / 青 / 暖橙）在漩涡坐标里游走、叠加发光，中心白热、边缘随声音起伏，按“发光”输出预乘透明度，叠在任何桌面上都自然。
-  时间统一取墙钟，所以启动动画窗口、面板和托盘里的光团花纹同相。
-- 启动交接：动画开始飞行时 Rust 先把面板窗口以全透明待命态显示出来，落地瞬间面板光球接替动画光球，板以圆形 `clip-path` 从光球中心绽开，动画窗口随后关闭，中间没有空档。
-- 面板窗口：无边框、透明、置顶、不进任务栏，贴住主显示器工作区右下角；失焦或 Esc 时先播收起动画再隐藏，隐藏时自动暂停 WebGL 与动画循环以降低后台开销。
-- 桥接：Rust 用 `std::process` 启动 sidecar，stdout 逐行解析 JSON；界面通过 `invoke('sidecar_call')` 发命令，
-  通过 `listen('sidecar:event')` 收状态、20 Hz 电平和扫描进度。界面与 sidecar 之间不开端口；画面对齐功能仅在 `127.0.0.1:17321` 监听回环 HTTP（校验 `Host` 标头、不开放跨站 CORS）供 Chrome 扩展后台查询延迟配置。
-- AirPlay 2 实时流：HAP 瞬时配对（SRP-6a 3072 / SHA-512）→ ChaCha20-Poly1305 加密 RTSP → NTP 授时 →
-  未压缩 ALAC + ChaCha20 的 RTP 音频，每秒同步包，丢包重传，2 秒一次心跳。
-- 系统声音：WASAPI 回环可抓取默认播放设备或指定输出端点（声卡 / 虚拟声卡），96 抽头 Kaiser 窗 sinc 重采样到 44.1kHz，
-  带漂移补偿；系统无声时自动补静音。
-- 设备发现不依赖多播 mDNS：扫描本机网段的 TCP 7000，读取 `/info`。立体声对角色看 TXT 的 `tsid`（同一对相同）、
-  `igl`（自称组长）和 `pgid`（隶属上级分组）。同一对按整组裁决（`Discovery.ResolvePairs`）：一台自称组长且无 `pgid`、另一台自称成员且带 `pgid` 时才算成对，
-  否则两台都标为「未成对」并保留各自的报告，不替它们猜角色。
-- 成对时把组长记进 `PairLeaders`（`config.json`）；点成员时优先连现场确认的组长，现场探不到组长时用记住的组长。
-  两台都自称组长（未成对）时按所选设备连接，不强制改目标——此时本来就没有可保护的分组。每 30 秒重读一次角色，跟随播放 / 空闲状态变化并刷新界面。
+- **毛玻璃**：`backdrop-filter: blur() saturate() brightness()` 搭配多層內描邊高光與漸層描邊；面板自帶一層柔焦背景（徑向漸層與雜訊顆粒），無論桌布為何種顏色都能呈現通透感。
+- **Siri 光團**：五團彩光（品紅 / 藍 / 紫 / 青 / 暖橘）在漩渦座標中游走並疊加發光，中心白熱、邊緣隨聲音起伏，以預乘透明度輸出，疊在任何桌面上都自然。時間統一取牆鐘，讓啟動動畫、面板與系統匣中的光團花紋同相銜接。
+- **啟動交接**：動畫開始飛行時，Rust 會先將面板視窗以全透明待命態顯示出來；落地瞬間面板光球無縫接替動畫光球，面板以圓形 `clip-path` 自光球中心綻開，隨後關閉動畫視窗。
+- **面板視窗**：無邊框、透明、置頂、不進工作列，貼齊主螢幕工作區右下角；失焦或按 `Esc` 時先播放收合動畫再隱藏，隱藏期間自動暫停 WebGL 與動畫迴圈以降低背景耗電。
+- **橋接與安全**：Rust 以 `std::process` 啟動 sidecar，stdout 逐行解析 JSON；介面透過 `invoke('sidecar_call')` 發送指令，並以 `listen('sidecar:event')` 接收狀態、20 Hz 電平與掃描進度。介面與 sidecar 之間不開啟連接埠；畫面對齊功能僅在 `127.0.0.1:17321` 監聽本機回環 HTTP（驗證 `Host` 標頭、不開放跨站 CORS）供 Chrome 擴充功能背景查詢延遲設定。
+- **AirPlay 2 即時串流**：HAP 瞬時配對（SRP-6a 3072 / SHA-512）→ ChaCha20-Poly1305 加密 RTSP → NTP 授時 → 未壓縮 ALAC + ChaCha20 加密 RTP 音訊，每秒同步封包、支援遺失封包重傳、每 2 秒心跳。
+- **系統聲音**：WASAPI 回環支援擷取預設播放裝置或指定輸出端點（音效卡 / 虛擬音效卡），以 96 抽頭 Kaiser 窗 sinc 重取樣至 44.1 kHz 並具漂移補償，系統無聲時自動補靜音。
+- **裝置探索**：不依賴多播 mDNS，直接掃描本機網段 TCP 7000 並讀取 `/info`。立體聲對角色依據 TXT 的 `tsid`、`igl`（自稱組長）與 `pgid`（隸屬上級群組）按整組裁決（`Discovery.ResolvePairs`）：僅一台自稱組長且無 `pgid`、另一台自稱成員且帶 `pgid` 時才算成對，否則皆標示為「未成對」並保留各自回報。
+- **群組記憶**：確認成對時會將組長寫入 `PairLeaders`（`config.json`）；點選成員時優先連線現場確認的組長，現場探不到則使用記錄的組長；每 30 秒重新讀取一次角色以跟隨播放 / 閒置狀態變化。
 
-## 开发与测试（都不联网、不出声）
+## 開發與測試（皆不連網、不出聲）
 
-需要 Rust 1.77+、.NET 8 SDK、Node 20+。
+需要 Rust 1.77+、.NET 8 SDK、Node.js 20+。
 
 ```powershell
 cd Desktop
 npm install
 
-# 开发：tauri dev（自动构建 sidecar、启动 Vite、编译并打开应用）
+# 開發模式：tauri dev（自動建置 sidecar、啟動 Vite、編譯並開啟應用）
 npm run dev
 
-# 只看界面：浏览器打开 http://127.0.0.1:5173/?preview=streaming （还有 idle / connecting / failed，&page=settings 翻面，&page=audio 看声卡选择，
-# ?view=intro&preview=1&t=1.0 看启动动画某一帧，?view=orbtest&bg=dark 看各状态光团）
+# 僅預覽介面：瀏覽器開啟 http://127.0.0.1:5173/?preview=streaming
+# （另有 idle / connecting / failed，&page=settings 翻面，&page=audio 看音效卡選擇，
+# ?view=intro&preview=1&t=1.0 看啟動動畫特定幀，?view=orbtest&bg=dark 看各狀態光團）
 npm run dev:web
 
-# 打包 NSIS 安装程序
+# 打包 NSIS 安裝程式
 npm run pack
 
-# 端到端测试：本机假 HomePod + 真实 Tauri 应用，WebView2 CDP 驱动（启动交接、面板位置、连接 / 音量 / 设置 / 收起 / 单实例 / 退出）
+# 端對端測試：本機假 HomePod + 真實 Tauri 應用，WebView2 CDP 驅動
 npm run e2e
-# 加 --shots 同时连拍桌面右下区域，核对真实桌面上的动画（输出 Desktop\shots\live\）
+# 加 --shots 可同時連拍桌面右下區域，核對真實桌面上的動畫（輸出至 Desktop\shots\live\）
 node scripts/e2e.mjs --shots
 
-# 渲染 7 个面板状态（含声卡选择、关闭背景卡片）+ 3 帧启动动画到 ..\shots
+# 渲染 7 個面板狀態（含音效卡選擇、關閉背景卡片）+ 3 幀啟動動畫到 ..\shots
 npm run shots
 
-# 立体声对实机检查：只读探测两台 /info，按实际报告检查选择成员时的行为（成对改连组长，未成对保持所选，均不连接、不出声）
-node scripts/pair-check.mjs 192.168.1.71 192.168.1.23
+# 立體聲對實機檢查：唯讀探測兩台 /info，確認選擇成員時的行為（不連線、不出聲）
+node scripts/pair-check.mjs 192.0.2.10 192.0.2.11
 ```
 
-已安装的 HomePodSender 正在运行时，端到端测试会自动用隔离模式（环境变量 `HPS_ISOLATED=1`：不注册单实例、WebView2 用单独的数据目录），
-不会去唤出你正在用的那个程序，此时跳过两项单实例检查；截图模式总是隔离。
+若已安裝的 HomePodSender 正在執行，端對端測試會自動進入隔離模式（環境變數 `HPS_ISOLATED=1`：不註冊單實例、WebView2 使用獨立資料目錄），不會影響正在使用的程式，此時會跳過兩項單實例檢查；截圖模式永遠使用隔離模式。
 
-截图和测试脚本会自动拉起 Vite；Tauri 的 debug 构建从 `http://127.0.0.1:5173` 加载界面。
-改过 Rust 外壳后需要 `cargo build --manifest-path src-tauri/Cargo.toml`（或跑一次 `npm run dev`）。
-调试版启动参数：`--tray` 不播启动动画、直接收在托盘；`--dump-tray <目录>` 导出托盘图标帧（配合 `design-ref\compose_tray.py` 预览）；
-`--dump-app-icons <目录>` 导出应用图标帧，再用 `design-ref\make_app_icons.py <目录> src-tauri\icons` 生成 exe / 安装包图标（同一颗光团）。
-环境变量 `HPS_KEEP_PANEL=1` 让面板失焦时不自动收起（自动化测试用）。
+截圖與測試腳本會自動啟動 Vite；Tauri 的 debug 建置由 `http://127.0.0.1:5173` 載入介面。
+修改 Rust 外殼後需執行 `cargo build --manifest-path src-tauri/Cargo.toml`（或跑一次 `npm run dev`）。
+偵錯版啟動參數：`--tray` 不播啟動動畫、直接收在系統匣；`--dump-tray <目錄>` 匯出系統匣圖示幀（搭配 `design-ref\compose_tray.py` 預覽）；
+`--dump-app-icons <目錄>` 匯出應用程式圖示幀，再以 `design-ref\make_app_icons.py <目錄> src-tauri\icons` 產生 exe 與安裝程式圖示。
+環境變數 `HPS_KEEP_PANEL=1` 可讓面板失焦時不自動收合（供自動化測試使用）。
 
-核心协议自测（不需要界面）：
+核心協定自測（無需介面）：
 
 ```powershell
 dotnet build Ap2Cli\Ap2Cli.csproj
-dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll selftest          # 加密/编码/时间换算自测
-dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll e2e-test          # 与本机假 HomePod 端到端
-dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll controller-test   # 连接/音量/重连/断开
-dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll probe <IP> [<IP>…] [--txt]   # 只读读取 /info 与立体声对角色，--txt 显示 igl / gid / pgid
+dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll selftest          # 加密 / 編碼 / 時間換算 / LipSync 自測
+dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll resample-test     # 重取樣精度與抗混疊測試
+dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll e2e-test          # 與本機假 HomePod 端對端測試
+dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll controller-test   # 連線 / 音量 / 重連 / 中斷測試
+dotnet Ap2Cli\bin\Debug\net8.0-windows\Ap2Cli.dll probe <IP> [<IP>…] [--txt]   # 唯讀讀取 /info 與立體聲對角色
 ```
 
-`Ap2Cli run --ip <IP>` 会真的连接 HomePod，默认推静音；必须显式加 `--sound` 才发声。
+`Ap2Cli run --ip <IP>` 會實際連線至 HomePod，預設推送靜音；必須明確加上 `--sound` 才會發聲。
 
-## 开源、许可与免责
+## 開源、授權與免責聲明
 
-本项目以 **MIT 许可**开源，见 [LICENSE](LICENSE)。
+本專案以 **MIT 授權條款**開源，詳見 [LICENSE](LICENSE)。
 
-- 单文件桌面应用，全部源码在本仓库：C# 协议与音频（`Ap2Core`）、sidecar 进程（`Sidecar`）、Tauri 外壳（`Desktop/src-tauri`）、React 界面（`Desktop/src`）、命令行诊断（`Ap2Cli`）。
-- 仓库里不含任何配对密钥、账号信息或你的设备配置：配对凭证运行时才生成，配置文件落在 `%APPDATA%\HomePodSender\config.json`。
-- 欢迎 issue / PR。改动协议或音频链路时请先跑 `Ap2Cli selftest` 与 `npm run e2e`（都是本机假 HomePod，不联网、不出声）。
+- 全部原始碼皆在本倉庫中：C# 協定與音訊（`Ap2Core`）、sidecar 行程（`Sidecar`）、Tauri 外殼（`Desktop/src-tauri`）、React 介面（`Desktop/src`）、Chrome 擴充功能（`Desktop/lipsync/extension`）與命令列診斷工具（`Ap2Cli`）。
+- 倉庫內不含任何配對金鑰、帳號資訊或個人裝置設定：配對憑證於執行期動態產生，組態檔儲存在 `%APPDATA%\HomePodSender\config.json`。
+- 歡迎提交 issue 或 PR；修改協定或音訊鏈路時，請先執行 `Ap2Cli selftest`、`Ap2Cli e2e-test` 與 `npm run e2e`。
 
-**免责声明**：本项目与 Apple Inc. 无任何关联，也未获其授权或认可。AirPlay、AirPlay 2、HomePod、Apple 为 Apple Inc. 的商标。
-这里的 AirPlay 2 实现来自对公开协议行为的独立实现，仅供个人在自己的设备上使用；请自行确认在你所在地区的合法性，作者不对使用后果承担责任。
+**免責聲明**：本專案與 Apple Inc. 無任何關聯，亦未獲其授權或認可。AirPlay、AirPlay 2、HomePod、Apple 為 Apple Inc. 之商標。
+此處的 AirPlay 2 實作係對公開協定行為的獨立實作，僅供個人於自有裝置上使用；請自行確認於所在地區之合法性，作者不對使用後果承擔責任。
 
 ## 已知限制
 
-- 延迟可调 0–2 秒；低延迟更容易受 Wi-Fi 抖动影响，0 秒为实验值。音乐建议从 0.25–0.5 秒开始。
-- 回环抓取的是所选播放端点的混音：电脑本机也会同时播放（耳机/音箱），不想听可在系统里把该输出设备静音或调低。
-- 一次只连一个目标（立体声对算一个）；非立体声对的多房间同步播放暂未做。
-- 两台 HomePod 没有配成立体声对时，程序只能从所选的那一台出声；这由 Home App 里的立体声对状态决定，需要在那边修好。
-- 面板固定出现在**主显示器**右下角（任务栏在底部时）；任务栏放在侧边或顶部时位置会贴工作区右下角，但不一定靠着托盘。
-- Windows 防火墙开启时，首次运行可能弹出“允许访问”提示，需要允许专用网络（HomePod 要回送授时和重传包）。
-- 安装包未签名，首次运行 SmartScreen 可能提示；WebView2 缺失的 Windows 10 需要先安装运行时。
+- 延遲可調範圍為 0–2 秒；較低延遲更容易受 Wi-Fi 抖動影響，0 秒為實驗值，聽音樂建議從 0.25–0.5 秒開始嘗試。
+- 回環擷取的是所選播放端點的混音：電腦本機也會同時播放（耳機 / 喇叭），若不想聽見本機聲音，可在系統中將該輸出裝置調低或靜音。
+- 一次僅連線一個目標（立體聲對視為單一目標）；非立體聲對的多房間同步播放尚未實作。
+- 兩台 HomePod 未配對成立體聲對時，無法由本程式分離左右聲道，需在 Apple「家庭（Home）」App 內重新配對。
+- 面板固定出現在**主螢幕**右下角（工作列位於底部時）；若工作列置於側邊或頂部，面板仍貼齊工作區右下角，不一定緊鄰系統匣圖示。
+- 開啟 Windows 防火牆時，首次執行可能跳出「允許存取」提示，請允許私人網路（HomePod 需回傳授時與重傳封包）。
+- 安裝程式尚未經過程式碼簽章，首次執行時 Windows SmartScreen 可能會顯示警告；缺少 WebView2 的 Windows 10 需先安裝執行環境。
